@@ -1,0 +1,108 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Candidates & external experimental clones
+candidates/
+
+.vscode/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# Data files (large files)
+*.feather
+*.parquet
+*.h5
+*.hdf5
+
+# Model files (large files)
+*.pth
+*.pt
+*.ckpt
+*.bin
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+.python-version
+
+# Runtime predictions and artifacts
+webui/prediction_results/
+graphify-out/
+data/_temp*
+
+data/paper_trading_state.json
+data/binance_*
+data/gemini_share.html
+data/blueprint_index.html
+data/fetch_gemini.py
+data/parse_gemini.py
+data/aws_trade_quota.json
+data/tiger_radar.json
+data/tiger_state.json
+data/storm_state.json
+data/tiger_trades.db
+data/trade_autopsies.db
+data/risk_ledger.db
+scratch/
+*.tar.gz
+
+# Node.js / TypeScript & Workspace Metadata
+node_modules/
+*.tsbuildinfo
+.aistudio/
+

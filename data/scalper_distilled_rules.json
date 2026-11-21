@@ -1,0 +1,22 @@
+{
+  "audit_id": "DISTILL-20261119-070914",
+  "timestamp_utc": "2026-11-19T07:09:14.403157+00:00",
+  "sample_size": 10,
+  "win_rate_pct": 0.0,
+  "profit_factor": 0.0,
+  "realization_tax_drag_bps": 24.0,
+  "dominant_root_cause": "FRICTION_BLEED",
+  "recommended_remedy": "Enforce Lessons 46-48: Mandatory 8m stagnation cutoff, 15m max duration, R_drag <= 0.30 fee hurdle, and Volume Profile pPOC spatial veto. Quarantined ETHUSDT (-.96 fee bleed) and SOLUSDT.",
+  "calibrated_parameters": {
+    "atr_stop_multiplier": 1.0,
+    "fee_hurdle_pct": 1.25,
+    "min_win_prob_pct": 70.0,
+    "ratchet_trigger_pct": 0.85
+  },
+  "quarantined_symbols": [
+    "SOLUSDT",
+    "ETHUSDT"
+  ],
+  "synced_to_aws": false,
+  "aws_sync_notes": ""
+}
