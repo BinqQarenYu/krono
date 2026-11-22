@@ -63,7 +63,7 @@ export interface NeonDynamicParameters {
 }
 
 export interface NeonBleedTelemetry {
-  data_mode: 'LIVE_TELEMETRY' | 'BLEED_STRESS_DRILL';
+  data_mode: 'LIVE_TELEMETRY' | 'BLEED_STRESS_DRILL' | 'WIN_SIMULATION';
   bleed_score: number; // 0..100
   circuit_tier: BleedCircuitTier;
   current_drawdown_pct: number;
@@ -112,7 +112,7 @@ export interface NeonAiBleedAssessment {
   assessment_id: string;
   timestamp_utc: string;
   model: string;
-  data_mode: 'LIVE_TELEMETRY' | 'BLEED_STRESS_DRILL';
+  data_mode: 'LIVE_TELEMETRY' | 'BLEED_STRESS_DRILL' | 'WIN_SIMULATION';
   bleed_score_at_audit: number;
   diagnosis_headline: string;
   bleed_severity: BleedCircuitTier;
@@ -194,9 +194,11 @@ export async function computeNeonDynamicState(params: {
   openPositionCount?: number;
   config?: NeonStrategyConfig;
   simulateBleed?: boolean;
+  simulateWin?: boolean;
 }): Promise<NeonDynamicStatePayload> {
   const cfg = params.config || loadNeonConfig();
   const simulateBleed = Boolean(params.simulateBleed);
+  const simulateWin = !simulateBleed && Boolean(params.simulateWin);
 
   // 1. Live Tier-1 Universe Scan + Core Basket Equity Curve (Exact Decimal)
   const [scanner, basketCurve] = await Promise.all([
@@ -365,7 +367,7 @@ export async function computeNeonDynamicState(params: {
     })
     .sort((a, b) => a.net_pnl_usd - b.net_pnl_usd);
 
-  // Optional Stress Drill injection (explicitly tagged as BLEED_STRESS_DRILL)
+  // Optional Stress Drill or Win Simulation injection (explicitly tagged)
   if (simulateBleed) {
     currentDdPct = 6.84;
     maxDdPct = Math.max(maxDdPct, 7.12);
@@ -382,6 +384,23 @@ export async function computeNeonDynamicState(params: {
       { symbol: 'LINKUSDT', trades: 5, wins: 2, losses: 3, win_rate_pct: 40.0, net_pnl_usd: -1.45, status: 'DRIFTING' },
       { symbol: 'BNBUSDT', trades: 4, wins: 2, losses: 2, win_rate_pct: 50.0, net_pnl_usd: 0.18, status: 'HEALTHY' },
       { symbol: 'BTCUSDT', trades: 6, wins: 4, losses: 2, win_rate_pct: 66.7, net_pnl_usd: 2.36, status: 'HEALTHY' },
+    ];
+  } else if (simulateWin) {
+    currentDdPct = 0.42;
+    maxDdPct = 1.85;
+    consecutiveLosses = 0;
+    rolling10Wr = 70.0;
+    rolling10Net = 48.6;
+    rolling10Exp = 4.86;
+    feeDragRatio = 6.4;
+    bleedVelocity = 5.45;
+    regime = 'TREND_EXPANSION';
+    symbolHealth = [
+      { symbol: 'BTCUSDT', trades: 12, wins: 9, losses: 3, win_rate_pct: 75.0, net_pnl_usd: 28.4, status: 'HEALTHY' },
+      { symbol: 'ETHUSDT', trades: 10, wins: 7, losses: 3, win_rate_pct: 70.0, net_pnl_usd: 21.15, status: 'HEALTHY' },
+      { symbol: 'SOLUSDT', trades: 11, wins: 8, losses: 3, win_rate_pct: 72.7, net_pnl_usd: 24.8, status: 'HEALTHY' },
+      { symbol: 'LINKUSDT', trades: 9, wins: 6, losses: 3, win_rate_pct: 66.7, net_pnl_usd: 15.65, status: 'HEALTHY' },
+      { symbol: 'BNBUSDT', trades: 8, wins: 5, losses: 3, win_rate_pct: 62.5, net_pnl_usd: 11.2, status: 'HEALTHY' },
     ];
   }
 
@@ -531,7 +550,11 @@ export async function computeNeonDynamicState(params: {
       total_universe: scanner.evaluations.length,
     },
     bleed_telemetry: {
-      data_mode: simulateBleed ? 'BLEED_STRESS_DRILL' : 'LIVE_TELEMETRY',
+      data_mode: simulateBleed
+        ? 'BLEED_STRESS_DRILL'
+        : simulateWin
+        ? 'WIN_SIMULATION'
+        : 'LIVE_TELEMETRY',
       bleed_score: bleedScore,
       circuit_tier: circuitTier,
       current_drawdown_pct: Number(currentDdPct.toFixed(2)),

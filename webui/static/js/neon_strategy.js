@@ -3,7 +3,7 @@
 
     let neonCachedData = null;
     let neonDynamicState = null;
-    let neonSimulateBleedDrill = false;
+    let neonDynamicMode = 'live'; // 'live' | 'win' | 'bleed'
     let neonLatestAiPatch = null;
 
     function escapeHtml(str) {
@@ -253,6 +253,12 @@
             if (typeof window.loadNeonEquityCurve === 'function') {
                 window.loadNeonEquityCurve();
             }
+            if (typeof window.runNeonWinSimulationUI === 'function' && !window.getLatestNeonWinSimulation?.()) {
+                window.runNeonWinSimulationUI();
+            }
+            if (typeof window.loadNeonCandlesticks === 'function') {
+                window.loadNeonCandlesticks();
+            }
             loadNeonDynamicState();
         } catch (err) {
             if (typeof window.showKronosToast === 'function') {
@@ -377,11 +383,11 @@
         const ap = dyn.adaptive_params || {};
 
         const liveBtn = document.getElementById('neon-bleed-mode-live');
+        const winBtn = document.getElementById('neon-bleed-mode-win');
         const drillBtn = document.getElementById('neon-bleed-mode-drill');
-        if (liveBtn && drillBtn) {
-            liveBtn.classList.toggle('active', !neonSimulateBleedDrill);
-            drillBtn.classList.toggle('active', neonSimulateBleedDrill);
-        }
+        if (liveBtn) liveBtn.classList.toggle('active', neonDynamicMode === 'live');
+        if (winBtn) winBtn.classList.toggle('active', neonDynamicMode === 'win');
+        if (drillBtn) drillBtn.classList.toggle('active', neonDynamicMode === 'bleed');
 
         const adaptBtn = document.getElementById('neon-dyn-adapt-btn');
         if (adaptBtn) {
@@ -397,8 +403,13 @@
         setElText('neon-dyn-regime', String(micro.regime || 'NORMAL_BALANCED').replace(/_/g, ' '));
         const tierEl = document.getElementById('neon-dyn-tier');
         if (tierEl) {
-            const drillTag = bleed.data_mode === 'BLEED_STRESS_DRILL' ? ' [DRILL]' : '';
-            tierEl.textContent = `${String(bleed.circuit_tier || 'NOMINAL').replace(/_/g, ' ')} · ${bleed.bleed_score ?? 0}/100${drillTag}`;
+            const modeTag =
+                bleed.data_mode === 'BLEED_STRESS_DRILL'
+                    ? ' [DRILL]'
+                    : bleed.data_mode === 'WIN_SIMULATION'
+                    ? ' [WIN SIM]'
+                    : '';
+            tierEl.textContent = `${String(bleed.circuit_tier || 'NOMINAL').replace(/_/g, ' ')} · ${bleed.bleed_score ?? 0}/100${modeTag}`;
             tierEl.className = `neon-eq-stat-val ${tierColorClass(bleed.circuit_tier)}`;
         }
 
@@ -476,7 +487,12 @@
 
         const vm = document.getElementById('neon-ai-verdict-meta');
         if (vm) {
-            const modeTag = a.data_mode === 'BLEED_STRESS_DRILL' ? ' · Stress Drill' : ' · Live';
+            const modeTag =
+                a.data_mode === 'BLEED_STRESS_DRILL'
+                    ? ' · Stress Drill'
+                    : a.data_mode === 'WIN_SIMULATION'
+                    ? ' · Win Simulation'
+                    : ' · Live';
             vm.textContent = `${String(a.bleed_severity || 'NOMINAL').replace(/_/g, ' ')} · Score ${a.bleed_score_at_audit ?? 0}/100${modeTag}`;
             vm.className = `neon-ai-verdict-meta ${tierColorClass(a.bleed_severity)}`;
         }
@@ -523,7 +539,10 @@
     async function loadNeonDynamicState() {
         try {
             const resp = await axios.get('/api/neon/dynamic-state', {
-                params: { simulate_bleed: neonSimulateBleedDrill ? 'true' : 'false' },
+                params: {
+                    simulate_bleed: neonDynamicMode === 'bleed' ? 'true' : 'false',
+                    simulate_win: neonDynamicMode === 'win' ? 'true' : 'false',
+                },
                 timeout: 12000,
             });
             if (resp.data && resp.data.success && resp.data.dynamic_state) {
@@ -534,11 +553,15 @@
         }
     }
 
-    function setNeonBleedDrillMode(enableDrill) {
-        const next = Boolean(enableDrill);
-        if (next === neonSimulateBleedDrill) return;
-        neonSimulateBleedDrill = next;
+    function setNeonDynamicTelemetryMode(mode) {
+        const next = mode === 'bleed' ? 'bleed' : mode === 'win' ? 'win' : 'live';
+        if (next === neonDynamicMode) return;
+        neonDynamicMode = next;
         loadNeonDynamicState();
+    }
+
+    function setNeonBleedDrillMode(enableDrill) {
+        setNeonDynamicTelemetryMode(enableDrill ? 'bleed' : 'live');
     }
 
     async function toggleNeonDynamicFlag(flagName) {
@@ -547,7 +570,8 @@
         try {
             const resp = await axios.post('/api/neon/dynamic-mode', {
                 [flagName]: !currentVal,
-                simulate_bleed: neonSimulateBleedDrill,
+                simulate_bleed: neonDynamicMode === 'bleed',
+                simulate_win: neonDynamicMode === 'win',
             });
             if (resp.data && resp.data.success) {
                 if (resp.data.dynamic_state) renderDynamicState(resp.data.dynamic_state);
@@ -581,7 +605,8 @@
             const resp = await axios.post(
                 '/api/neon/ai-bleed-audit',
                 {
-                    simulate_bleed: neonSimulateBleedDrill,
+                    simulate_bleed: neonDynamicMode === 'bleed',
+                    simulate_win: neonDynamicMode === 'win',
                     focus_note: focusNote,
                 },
                 { timeout: 60000 }
@@ -590,18 +615,18 @@
                 renderAiAssessment(resp.data.assessment);
                 if (typeof window.showKronosToast === 'function') {
                     window.showKronosToast(
-                        `AI Bleed Audit complete (${resp.data.assessment.bleed_severity}). Review & apply patch below.`,
+                        `AI Strategy Audit complete (${resp.data.assessment.bleed_severity}). Review & apply patch below.`,
                         'success'
                     );
                 }
             } else {
-                throw new Error((resp.data && resp.data.error) || 'AI Bleed Audit failed.');
+                throw new Error((resp.data && resp.data.error) || 'AI Strategy Audit failed.');
             }
         } catch (err) {
             const msg =
                 (err && err.response && err.response.data && err.response.data.error) ||
                 (err && err.message) ||
-                'AI Bleed Audit request failed.';
+                'AI Strategy Audit request failed.';
             if (errEl) {
                 errEl.textContent = msg;
                 errEl.style.display = 'block';
@@ -627,7 +652,8 @@
         try {
             const resp = await axios.post('/api/neon/ai-apply-patch', {
                 patch: neonLatestAiPatch,
-                simulate_bleed: neonSimulateBleedDrill,
+                simulate_bleed: neonDynamicMode === 'bleed',
+                simulate_win: neonDynamicMode === 'win',
             });
             if (resp.data && resp.data.success) {
                 if (typeof window.showKronosToast === 'function') {
@@ -657,6 +683,7 @@
     window.runNeonInteractiveBacktest = runNeonInteractiveBacktest;
     window.dispatchNeonTicket = dispatchNeonTicket;
     window.loadNeonDynamicState = loadNeonDynamicState;
+    window.setNeonDynamicTelemetryMode = setNeonDynamicTelemetryMode;
     window.setNeonBleedDrillMode = setNeonBleedDrillMode;
     window.toggleNeonDynamicFlag = toggleNeonDynamicFlag;
     window.runNeonAiBleedAudit = runNeonAiBleedAudit;
