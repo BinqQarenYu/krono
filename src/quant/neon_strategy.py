@@ -507,8 +507,18 @@ def evaluate_neon_universe(
         curr_c = candles[last_idx]
         prev_c = candles[prev_idx]
 
-        bull_pull = (curr_c["low"] <= e9[last_idx] * 1.002 or prev_c["low"] <= e21[prev_idx] * 1.002) and (curr_c["close"] > curr_c["open"]) and (curr_c["close"] > prev_c["high"])
-        bear_pull = (curr_c["high"] >= e9[last_idx] * 0.998 or prev_c["high"] >= e21[prev_idx] * 0.998) and (curr_c["close"] < curr_c["open"]) and (curr_c["close"] < prev_c["low"])
+        # Pullback touch: either current bar dipped to EMA9/EMA21 zone, OR previous bar dipped to EMA9/EMA21 zone
+        bull_touched = (
+            curr_c["low"] <= e9[last_idx] * 1.004 or curr_c["low"] <= e21[last_idx] * 1.004 or
+            prev_c["low"] <= e9[prev_idx] * 1.004 or prev_c["low"] <= e21[prev_idx] * 1.004
+        )
+        bear_touched = (
+            curr_c["high"] >= e9[last_idx] * 0.996 or curr_c["high"] >= e21[last_idx] * 0.996 or
+            prev_c["high"] >= e9[prev_idx] * 0.996 or prev_c["high"] >= e21[prev_idx] * 0.996
+        )
+
+        bull_pull = bull_touched and (curr_c["close"] > curr_c["open"]) and (curr_c["close"] >= prev_c["close"])
+        bear_pull = bear_touched and (curr_c["close"] < curr_c["open"]) and (curr_c["close"] <= prev_c["close"])
 
         cand_side = "LONG" if trend_up else ("SHORT" if trend_dn else "FLAT")
 
@@ -529,7 +539,8 @@ def evaluate_neon_universe(
         risk_usd_d = account_equity * Decimal(str(float(cfg.get("risk_per_trade_pct", 1.5)) / 100.0))
         raw_notional_d = risk_usd_d / Decimal(str(sl_pct_val))
         max_notional_d = account_equity * Decimal(str(cfg.get("max_leverage", 3.5)))
-        notional_d = min(max_notional_d, raw_notional_d)
+        fat_finger_ceiling = max(Decimal("120.00"), account_equity * Decimal("0.50")) if account_equity <= Decimal("2500.00") else Decimal("25000.00")
+        notional_d = min(max_notional_d, raw_notional_d, fat_finger_ceiling)
         qty_d = (notional_d / entry_d).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
         est_maker_fee_d = notional_d * Decimal(str(float(cfg.get("maker_fee_rate", 0.0002)) * 2))
