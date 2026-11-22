@@ -244,6 +244,194 @@
             .join('');
     }
 
+    let neonChartInstance = null;
+    let neonCandleSeries = null;
+    let neonEma9Series = null;
+    let neonEma21Series = null;
+    let activePriceLines = [];
+
+    function renderCandlestickChart(candles, activePatterns, symbol) {
+        const container = document.getElementById('neon-cs-chart-container');
+        if (!container || !window.LightweightCharts || !Array.isArray(candles) || candles.length === 0) return;
+
+        if (!neonChartInstance) {
+            container.innerHTML = '';
+            const initialWidth = container.clientWidth > 0 ? container.clientWidth : ((container.parentElement && container.parentElement.clientWidth > 0) ? container.parentElement.clientWidth : 900);
+            neonChartInstance = window.LightweightCharts.createChart(container, {
+                width: initialWidth,
+                height: 320,
+                layout: {
+                    background: { color: '#0b0f19' },
+                    textColor: '#94a3b8',
+                    fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+                    fontSize: 11,
+                },
+                grid: {
+                    vertLines: { color: 'rgba(255, 255, 255, 0.04)' },
+                    horzLines: { color: 'rgba(255, 255, 255, 0.04)' },
+                },
+                crosshair: {
+                    mode: window.LightweightCharts.CrosshairMode.Normal,
+                },
+                rightPriceScale: {
+                    borderColor: 'rgba(255, 255, 255, 0.08)',
+                    autoScale: true,
+                },
+                timeScale: {
+                    borderColor: 'rgba(255, 255, 255, 0.08)',
+                    timeVisible: true,
+                    secondsVisible: false,
+                },
+            });
+
+            neonCandleSeries = neonChartInstance.addCandlestickSeries({
+                upColor: '#10b981',
+                downColor: '#ef4444',
+                borderUpColor: '#10b981',
+                borderDownColor: '#ef4444',
+                wickUpColor: '#10b981',
+                wickDownColor: '#ef4444',
+            });
+
+            neonEma9Series = neonChartInstance.addLineSeries({
+                color: '#38bdf8',
+                lineWidth: 2,
+                title: 'EMA-9',
+            });
+
+            neonEma21Series = neonChartInstance.addLineSeries({
+                color: '#a855f7',
+                lineWidth: 2,
+                title: 'EMA-21',
+            });
+
+            window.addEventListener('resize', () => {
+                if (neonChartInstance && container) {
+                    neonChartInstance.applyOptions({ width: container.clientWidth });
+                }
+            });
+        }
+
+        const sortedCandles = [...candles]
+            .filter(c => c && c.time && c.open && c.high && c.low && c.close)
+            .sort((a, b) => a.time - b.time);
+
+        const dedupedCandles = [];
+        const seenTimes = new Set();
+        for (const c of sortedCandles) {
+            if (!seenTimes.has(c.time)) {
+                seenTimes.add(c.time);
+                dedupedCandles.push(c);
+            }
+        }
+
+        if (dedupedCandles.length > 0) {
+            neonCandleSeries.setData(dedupedCandles);
+
+            function computeEma(data, period) {
+                const k = 2 / (period + 1);
+                let ema = data[0].close;
+                return data.map((d, i) => {
+                    if (i === 0) ema = d.close;
+                    else ema = d.close * k + ema * (1 - k);
+                    return { time: d.time, value: ema };
+                });
+            }
+
+            neonEma9Series.setData(computeEma(dedupedCandles, 9));
+            neonEma21Series.setData(computeEma(dedupedCandles, 21));
+
+            activePriceLines.forEach(l => {
+                try { neonCandleSeries.removePriceLine(l); } catch (e) {}
+            });
+            activePriceLines = [];
+
+            let activePos = null;
+            if (window._latestLivePositions && Array.isArray(window._latestLivePositions)) {
+                activePos = window._latestLivePositions.find(p => p.symbol === symbol && Math.abs(Number(p.position_amt || p.quantity || 0)) > 0);
+            }
+
+            const posTag = document.getElementById('neon-cs-live-pos-tag');
+            if (activePos) {
+                const entry = Number(activePos.entry_price || activePos.entryPrice || 0);
+                const side = (activePos.side || (Number(activePos.position_amt) >= 0 ? 'BUY' : 'SELL')).toUpperCase();
+                const pnl = Number(activePos.unrealized_pnl_usd || activePos.unrealizedProfit || 0);
+                const pnlSign = pnl >= 0 ? '+' : '';
+
+                if (posTag) {
+                    posTag.textContent = `🤖 ACTIVE ${side} @ $${entry.toLocaleString()} (PnL: ${pnlSign}$${pnl.toFixed(2)})`;
+                    posTag.style.display = 'inline';
+                }
+
+                if (entry > 0) {
+                    const entryLine = neonCandleSeries.createPriceLine({
+                        price: entry,
+                        color: '#38bdf8',
+                        lineWidth: 2,
+                        lineStyle: window.LightweightCharts.LineStyle.Solid,
+                        axisLabelVisible: true,
+                        title: `ENTRY (${side})`,
+                    });
+                    activePriceLines.push(entryLine);
+
+                    const sl = Number(activePos.stop_loss || 0);
+                    const tp = Number(activePos.take_profit || 0);
+                    if (sl > 0) {
+                        const slLine = neonCandleSeries.createPriceLine({
+                            price: sl,
+                            color: '#ef4444',
+                            lineWidth: 2,
+                            lineStyle: window.LightweightCharts.LineStyle.Dashed,
+                            axisLabelVisible: true,
+                            title: 'STOP LOSS',
+                        });
+                        activePriceLines.push(slLine);
+                    }
+                    if (tp > 0) {
+                        const tpLine = neonCandleSeries.createPriceLine({
+                            price: tp,
+                            color: '#10b981',
+                            lineWidth: 2,
+                            lineStyle: window.LightweightCharts.LineStyle.Dashed,
+                            axisLabelVisible: true,
+                            title: 'TAKE PROFIT',
+                        });
+                        activePriceLines.push(tpLine);
+                    }
+                }
+            } else {
+                if (posTag) posTag.style.display = 'none';
+            }
+
+            const markers = [];
+            if (Array.isArray(activePatterns)) {
+                activePatterns.filter(p => p.detected_recently).forEach(p => {
+                    const barsAgo = p.bars_ago || 0;
+                    const targetIdx = dedupedCandles.length - 1 - barsAgo;
+                    if (targetIdx >= 0 && targetIdx < dedupedCandles.length) {
+                        const candle = dedupedCandles[targetIdx];
+                        const isBull = p.bias === 'BULLISH';
+                        markers.push({
+                            time: candle.time,
+                            position: isBull ? 'belowBar' : 'aboveBar',
+                            color: isBull ? '#10b981' : p.bias === 'BEARISH' ? '#ef4444' : '#f59e0b',
+                            shape: isBull ? 'arrowUp' : p.bias === 'BEARISH' ? 'arrowDown' : 'circle',
+                            text: `${p.name} (${p.bias})`,
+                        });
+                    }
+                });
+            }
+            if (markers.length > 0) {
+                markers.sort((a, b) => a.time - b.time);
+                neonCandleSeries.setMarkers(markers);
+            } else {
+                neonCandleSeries.setMarkers([]);
+            }
+
+            neonChartInstance.timeScale().fitContent();
+        }
+    }
+
     function renderCandlestickPanel(payload) {
         if (!payload) return;
         csState.data = payload;
@@ -310,6 +498,7 @@
             );
         }
 
+        renderCandlestickChart(payload.candles, payload.patterns, payload.selected_symbol);
         renderModeBenchmarks(benchmarks);
         renderFleetStrip(payload.fleet_summaries);
         renderPatternsTable(payload.patterns);
@@ -321,6 +510,15 @@
             if (opts.symbol) csState.symbol = String(opts.symbol).toUpperCase();
             if (opts.interval) csState.interval = String(opts.interval).toLowerCase();
             if (opts.mode) csState.mode = String(opts.mode).toUpperCase();
+        } else {
+            // Auto-detect active live trade if available
+            const positions = window._latestLivePositions || [];
+            if (Array.isArray(positions) && positions.length > 0) {
+                const active = positions.find(p => Math.abs(Number(p.position_amt || p.quantity || 0)) > 0);
+                if (active && active.symbol) {
+                    csState.symbol = active.symbol;
+                }
+            }
         }
         syncControls();
 
@@ -402,6 +600,15 @@
         }
     }
 
+    function resizeNeonCandlestickChart() {
+        const container = document.getElementById('neon-cs-chart-container');
+        if (neonChartInstance && container && container.clientWidth > 0) {
+            neonChartInstance.applyOptions({ width: container.clientWidth });
+            neonChartInstance.timeScale().fitContent();
+        }
+    }
+
+    window.resizeNeonCandlestickChart = resizeNeonCandlestickChart;
     window.loadNeonCandlesticks = loadNeonCandlesticks;
     window.setNeonCandlestickSymbol = setNeonCandlestickSymbol;
     window.setNeonCandlestickInterval = setNeonCandlestickInterval;

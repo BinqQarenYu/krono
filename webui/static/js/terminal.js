@@ -46,6 +46,15 @@
         // Universal Multi-Bot Asset Identifier & Semantic Badge Renderer (MACRO / NEON / LIGHTNING)
         window._neonActiveSymbols = new Set(['BTCUSDT', 'ETHUSDT', 'LINKUSDT']);
 
+        window.openNeonCandlesticks = function(symbol) {
+            if (typeof switchAppView === 'function') {
+                switchAppView('neon');
+            }
+            if (typeof window.setNeonCandlestickSymbol === 'function') {
+                window.setNeonCandlestickSymbol(symbol);
+            }
+        };
+
         function renderBotAssetBadge(symbol, item) {
             if (!item) item = {};
             const rawTag = (item.bot_tag || item.trade_type || '').toUpperCase();
@@ -58,12 +67,14 @@
                 bot = 'MACRO';
             }
 
+            const clickAttr = `onclick="window.openNeonCandlesticks('${symbol}')" title="Click to view Live Candlesticks &amp; Brackets on NEON Dashboard" style="cursor: pointer; display: inline-flex; align-items: center;"`;
+
             if (bot === 'NEON') {
-                return `<strong class="pos-symbol" style="color: #f472b6; font-weight: 800;">${symbol}</strong><span class="badge-bot-neon" style="background: rgba(236, 72, 153, 0.16); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.5); font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px; margin-left: 6px; letter-spacing: 0.5px; box-shadow: 0 0 8px rgba(236, 72, 153, 0.25); vertical-align: middle;">🤖 NEON</span>`;
+                return `<span class="pos-sym-group" ${clickAttr}><strong class="pos-symbol" style="color: #f472b6; font-weight: 800; text-decoration: underline dotted rgba(244,114,182,0.4);">${symbol}</strong><span class="badge-bot-neon" style="background: rgba(236, 72, 153, 0.16); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.5); font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px; margin-left: 6px; letter-spacing: 0.5px; box-shadow: 0 0 8px rgba(236, 72, 153, 0.25); vertical-align: middle;">🤖 NEON</span></span>`;
             } else if (bot === 'LIGHTNING') {
-                return `<strong class="pos-symbol" style="color: #38bdf8; font-weight: 800;">${symbol}</strong><span class="badge-bot-lightning" style="background: rgba(56, 189, 248, 0.16); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.5); font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px; margin-left: 6px; letter-spacing: 0.5px; box-shadow: 0 0 8px rgba(56, 189, 248, 0.25); vertical-align: middle;">⚡ LIGHTNING</span>`;
+                return `<span class="pos-sym-group" ${clickAttr}><strong class="pos-symbol" style="color: #38bdf8; font-weight: 800; text-decoration: underline dotted rgba(56,189,248,0.4);">${symbol}</strong><span class="badge-bot-lightning" style="background: rgba(56, 189, 248, 0.16); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.5); font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px; margin-left: 6px; letter-spacing: 0.5px; box-shadow: 0 0 8px rgba(56, 189, 248, 0.25); vertical-align: middle;">⚡ LIGHTNING</span></span>`;
             } else {
-                return `<strong class="pos-symbol" style="color: #c084fc; font-weight: 800;">${symbol}</strong><span class="badge-bot-macro" style="background: rgba(163, 113, 247, 0.15); color: #c084fc; border: 1px solid rgba(163, 113, 247, 0.45); font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px; margin-left: 6px; letter-spacing: 0.5px; vertical-align: middle;">🌐 MACRO</span>`;
+                return `<span class="pos-sym-group" ${clickAttr}><strong class="pos-symbol" style="color: #c084fc; font-weight: 800; text-decoration: underline dotted rgba(192,132,252,0.4);">${symbol}</strong><span class="badge-bot-macro" style="background: rgba(163, 113, 247, 0.15); color: #c084fc; border: 1px solid rgba(163, 113, 247, 0.45); font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px; margin-left: 6px; letter-spacing: 0.5px; vertical-align: middle;">🌐 MACRO</span></span>`;
             }
         }
 
@@ -130,6 +141,11 @@
                 if (typeof window.loadNeonStrategy === 'function') {
                     window.loadNeonStrategy();
                 }
+                setTimeout(() => {
+                    if (typeof window.resizeNeonCandlestickChart === 'function') {
+                        window.resizeNeonCandlestickChart();
+                    }
+                }, 100);
             }
         }
 
@@ -179,6 +195,7 @@
             const acct = data.live_account || {};
             const trades = data.trade_history || data.live_trades || [];
             const positions = acct.positions || [];
+            window._latestLivePositions = positions;
 
             const wallet = Number(acct.total_wallet_balance_usd || 0);
             const avail = Number(acct.available_balance_usd || 0);
@@ -1060,6 +1077,7 @@
                 const posTbody = document.getElementById('live-active-positions-tbody');
                 if (posTbody) {
                     const positions = acct.positions || [];
+            window._latestLivePositions = positions;
                     const posSig = positions.map(p => `${p.symbol}:${p.position_amt}:${p.entry_price}:${p.mark_price}:${p.unrealized_pnl_usd}`).join('|');
                     if (window._lastLivePositionsSig !== posSig) {
                         window._lastLivePositionsSig = posSig;
