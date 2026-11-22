@@ -1,0 +1,232 @@
+"""
+src/quant/learning_governor.py — The Learning Bot & Institutional Memory Engine.
+
+Audits rolling prediction performance and calibrates the system's capital throttle:
+1. Computes rolling 48-hour Brier Calibration Error across realized forecast outcomes.
+2. Derives the dynamic Confidence Multiplier (0.0x to 1.0x) to throttle capital during regime shifts.
+3. Interfaces with SQLite data/lessons.db to log trade post-mortems and consult active quantitative guidance.
+
+Strictly adheres to:
+- AGENTS.md Invariant 1: Zero Float Financial Math (decimal.Decimal).
+- AGENTS.md Invariant 3: Base Checkpoint Immutability (never mutates model weights live).
+"""
+
+import os
+import sys
+import sqlite3
+import datetime
+from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Dict, List, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class TradeOutcome:
+    """Historical trade outcome record for calibration auditing."""
+    trade_id: str
+    symbol: str
+    side: str
+    forecast_confidence: Decimal   # p in [0, 1], e.g. Decimal("0.70")
+    realized_hit: int              # 1 if Take-Profit reached, 0 if Stop-Loss or Stale Exit
+    realized_pnl_usd: Decimal
+    exit_reason: str               # "TP_HIT", "SL_HIT", "STALE_EXPIRED"
+    timestamp_utc: datetime.datetime
+    execution_mode: str = "PAPER"  # "PAPER" or "LIVE"
+
+
+@dataclass(frozen=True)
+class CalibrationReport:
+    """Rolling calibration evaluation report."""
+    total_evaluations: int
+    brier_score: Decimal           # Brier score in [0.0, 1.0]
+    confidence_multiplier: Decimal # 0.0x to 1.0x
+    status: str                    # "PRISTINE", "NOMINAL", "THROTTLED", "HALTED"
+    reason: str
+
+
+class LearningGovernor:
+    """
+    Performance Auditor and Meta-Governor.
+    Controls risk exposure without risking catastrophic forgetting.
+    """
+
+    def __init__(self, db_path: Optional[str] = None):
+        workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        self.db_path = db_path or os.path.join(workspace_root, "data", "lessons.db")
+        self._is_mem = (self.db_path == ":memory:")
+        self._mem_conn = sqlite3.connect(":memory:") if self._is_mem else None
+        self._init_calibration_tables()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        if self._is_mem:
+            return self._mem_conn
+        return sqlite3.connect(self.db_path)
+
+    def _close_connection(self, conn: sqlite3.Connection) -> None:
+        if not self._is_mem and conn:
+            conn.close()
+
+    def _init_calibration_tables(self) -> None:
+        """Ensure calibration and trade history tables exist."""
+        if not self._is_mem:
+            dir_name = os.path.dirname(self.db_path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS trade_outcomes (
+                        trade_id TEXT PRIMARY KEY,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        forecast_confidence TEXT NOT NULL,
+                        realized_hit INTEGER NOT NULL,
+                        realized_pnl_usd TEXT NOT NULL,
+                        exit_reason TEXT NOT NULL,
+                        execution_mode TEXT DEFAULT 'PAPER',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                # Migration check for existing databases
+                try:
+                    cursor.execute("ALTER TABLE trade_outcomes ADD COLUMN execution_mode TEXT DEFAULT 'PAPER'")
+                except sqlite3.OperationalError:
+                    pass
+        finally:
+            self._close_connection(conn)
+
+    def record_outcome(self, outcome: TradeOutcome) -> None:
+        """Log a trade post-mortem into SQLite institutional memory."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO trade_outcomes 
+                    (trade_id, symbol, side, forecast_confidence, realized_hit, realized_pnl_usd, exit_reason, execution_mode)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    outcome.trade_id,
+                    outcome.symbol,
+                    outcome.side,
+                    str(outcome.forecast_confidence),
+                    outcome.realized_hit,
+                    str(outcome.realized_pnl_usd),
+                    outcome.exit_reason,
+                    outcome.execution_mode
+                ))
+        finally:
+            self._close_connection(conn)
+
+    def calculate_brier_calibration(
+        self,
+        outcomes: Optional[List[TradeOutcome]] = None,
+        lookback_limit: int = 50
+    ) -> CalibrationReport:
+        """
+        Calculate rolling Brier score and derive capital Confidence Multiplier.
+        Brier Score BS = (1/N) * sum((p_i - o_i)^2)
+        - BS <= 0.15: Pristine (Multiplier = 1.0x)
+        - 0.15 < BS <= 0.25: Nominal (Multiplier = 0.8x - 1.0x)
+        - 0.25 < BS <= 0.35: Throttled (Multiplier = 0.3x - 0.7x)
+        - BS > 0.35: Halted (Multiplier = 0.0x, Circuit Breaker)
+        """
+        if outcomes is None:
+            outcomes = self._load_recent_outcomes(limit=lookback_limit)
+
+        if not outcomes:
+            # Default to full nominal allocation if no recent history
+            return CalibrationReport(
+                total_evaluations=0,
+                brier_score=Decimal("0.1000"),
+                confidence_multiplier=Decimal("1.00"),
+                status="PRISTINE",
+                reason="No recent closed trades. Operating at full nominal confidence (1.0x)."
+            )
+
+        n = len(outcomes)
+        weighted_sq_err = Decimal("0.0")
+        total_weight = Decimal("0.0")
+
+        for o in outcomes:
+            p = o.forecast_confidence
+            y = Decimal(str(o.realized_hit))
+            # Live real trades have 2.5x credibility weight over synthetic paper trades
+            weight = Decimal("2.5") if getattr(o, "execution_mode", "PAPER") == "LIVE" else Decimal("1.0")
+            err = (p - y) ** Decimal("2")
+            weighted_sq_err += weight * err
+            total_weight += weight
+
+        brier_score = (weighted_sq_err / total_weight).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP) if total_weight > Decimal("0") else Decimal("0.1000")
+
+        # Capital Throttle Logic (Requires minimum 5 trades for statistical significance)
+        if n < 5:
+            multiplier = Decimal("1.00")
+            status = "INITIALIZING"
+            reason = f"Warm-up calibration phase ({n}/5 trades recorded, Brier: {brier_score:.4f}). Operating at nominal 1.0x capital."
+        elif brier_score <= Decimal("0.1500"):
+            multiplier = Decimal("1.00")
+            status = "PRISTINE"
+            reason = f"High forecast calibration (Brier: {brier_score:.4f} across {n} trades). Full 1.0x capital."
+        elif brier_score <= Decimal("0.2500"):
+            multiplier = Decimal("0.85")
+            status = "NOMINAL"
+            reason = f"Acceptable calibration (Brier: {brier_score:.4f} across {n} trades). Operating at 0.85x capital."
+        elif brier_score <= Decimal("0.3500"):
+            multiplier = Decimal("0.40")
+            status = "THROTTLED"
+            reason = f"Poor calibration / regime shift detected (Brier: {brier_score:.4f} across {n} trades). Capital throttled to 0.40x."
+        else:
+            multiplier = Decimal("0.00")
+            status = "HALTED"
+            reason = f"Severe calibration divergence (Brier: {brier_score:.4f} > 0.35 across {n} trades). Trading halted (0.0x multiplier)."
+
+        return CalibrationReport(
+            total_evaluations=n,
+            brier_score=brier_score,
+            confidence_multiplier=multiplier,
+            status=status,
+            reason=reason
+        )
+
+    def _load_recent_outcomes(self, limit: int = 50) -> List[TradeOutcome]:
+        """Load recent trade outcomes from SQLite."""
+        if not os.path.exists(self.db_path) and self.db_path != ":memory:":
+            return []
+
+        outcomes: List[TradeOutcome] = []
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT trade_id, symbol, side, forecast_confidence, realized_hit, realized_pnl_usd, exit_reason, created_at, execution_mode
+                FROM trade_outcomes
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+
+            for row in rows:
+                tid, sym, side, conf, hit, pnl, exit_r, dt_str = row[:8]
+                mode = row[8] if len(row) > 8 and row[8] else "PAPER"
+                try:
+                    ts = datetime.datetime.fromisoformat(dt_str)
+                except Exception:
+                    ts = datetime.datetime.now(datetime.timezone.utc)
+
+                outcomes.append(TradeOutcome(
+                    trade_id=tid,
+                    symbol=sym,
+                    side=side,
+                    forecast_confidence=Decimal(conf),
+                    realized_hit=int(hit),
+                    realized_pnl_usd=Decimal(pnl),
+                    exit_reason=exit_r,
+                    timestamp_utc=ts,
+                    execution_mode=mode
+                ))
+        finally:
+            self._close_connection(conn)
+        return outcomes

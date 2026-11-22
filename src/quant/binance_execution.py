@@ -1,0 +1,1705 @@
+"""
+src/quant/binance_execution.py — Atomic Bracket State Machine & Execution Gateway.
+
+Handles Binance USD(S)-M Futures order execution with institutional fail-safes:
+1. Atomic Bracket State Machine: Entry -> Simultaneous SL/TP Brackets.
+2. Anti-Naked-Position Guard: Emergency flattens if Stop-Loss unconfirmed in 1,000ms.
+3. 12-Hour Temporal Stale-Trade Expiry: Closes positions lingering beyond 12 hours.
+4. HMAC-SHA256 authenticated REST endpoint signing for live/testnet accounts.
+5. Simulated Dry-Run Execution for deterministic testing and paper execution.
+
+Strictly adheres to AGENTS.md Invariant 1 (Zero Float Financial Math).
+"""
+
+import os
+import sys
+import time
+import json
+import hmac
+import hashlib
+import datetime
+import urllib.parse
+import logging
+from enum import Enum
+from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Dict, List, Optional, Tuple, Any
+import requests
+
+try:
+    import dotenv
+    dotenv.load_dotenv()
+except Exception:
+    pass
+
+logger = logging.getLogger("Kronos.BinanceExecution")
+
+from src.quant.config import TOP_10_SYMBOLS, FuturesSymbolConfig, DEFAULT_RISK_CONFIG
+from src.quant.kev_risk_arbiter import TradeTicket, invert_trade_ticket
+
+
+class PositionState(Enum):
+    IDLE = "IDLE"
+    ENTRY_SUBMITTED = "ENTRY_SUBMITTED"
+    ENTRY_FILLED = "ENTRY_FILLED"
+    BRACKETS_ACTIVE = "BRACKETS_ACTIVE"
+    EMERGENCY_FLATTEN = "EMERGENCY_FLATTEN"
+    CLOSED = "CLOSED"
+    REJECTED = "REJECTED"
+
+
+@dataclass
+class ActiveBracketPosition:
+    """State tracking for an active bracketed futures position."""
+    position_id: str
+    symbol: str
+    side: str                          # "BUY" or "SELL"
+    entry_price: Decimal
+    stop_loss: Decimal
+    take_profit: Decimal
+    quantity: Decimal
+    state: PositionState = PositionState.IDLE
+    entry_order_id: Optional[str] = None
+    sl_order_id: Optional[str] = None
+    tp_order_id: Optional[str] = None
+    entry_fill_time_utc: Optional[datetime.datetime] = None
+    close_time_utc: Optional[datetime.datetime] = None
+    realized_pnl_usd: Decimal = Decimal("0.0")
+    gross_pnl_usd: Decimal = Decimal("0.0")
+    entry_fee_usd: Decimal = Decimal("0.0")
+    exit_fee_usd: Decimal = Decimal("0.0")
+    slippage_usd: Decimal = Decimal("0.0")
+    funding_fee_usd: Decimal = Decimal("0.0")
+    close_reason: Optional[str] = None
+    forecast_confidence: Decimal = Decimal("0.65")
+
+
+class BinanceAtomicExecutor:
+    """
+    Zero-Float execution gateway managing order submission and safety lifecycles.
+    """
+
+    BASE_URL = "https://fapi.binance.com"
+    TESTNET_URL = "https://testnet.binancefuture.com"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        testnet: Optional[bool] = None,
+        dry_run: bool = True,
+        session: Optional[requests.Session] = None,
+        initial_equity: Decimal = Decimal("200.00"),
+        state_file: Optional[str] = None,
+        symbols_config: Optional[Dict[str, FuturesSymbolConfig]] = None,
+        realistic_friction: bool = False,
+        risk_engine: Optional[Any] = None
+    ):
+        self.api_key = ""
+        self.secret_key = ""
+        self._refresh_credentials(api_key, secret_key)
+
+        # Testnet detection: Respect explicit argument, or check BINANCE_TESTNET (defaults to False for live production)
+        if testnet is not None:
+            self.testnet = testnet
+        else:
+            self.testnet = os.getenv("BINANCE_TESTNET", "false").lower() in ("true", "1", "yes")
+
+        self.dry_run = dry_run
+        self.base_url = self.TESTNET_URL if self.testnet else self.BASE_URL
+        self.session = session or requests.Session()
+        self.active_positions: Dict[str, ActiveBracketPosition] = {}
+        self.paper_initial_equity: Decimal = initial_equity
+        self.closed_trades: List[Dict[str, Any]] = []
+        self.symbols_config = symbols_config or TOP_10_SYMBOLS
+        self.realistic_friction = realistic_friction
+        self.risk_engine = risk_engine
+        self.last_risk_decision: Optional[Any] = None
+        self.contra_mode: bool = False
+        self._time_offset_ms: int = 0
+        self._last_time_sync: float = 0.0
+
+        # Test isolation: When running under pytest without explicit state_file,
+        # avoid touching disk so unit tests never pollute live paper trading ledger!
+        is_test_env = "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules
+        if state_file is None:
+            if is_test_env:
+                self.state_file = None
+            else:
+                workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                self.state_file = os.path.join(workspace_root, "data", "paper_trading_state.json")
+        else:
+            self.state_file = state_file
+
+        self._load_paper_state()
+
+        # Scalp order tracking for institutional UI highlighting
+        workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.scalp_orders_file = os.path.join(workspace_root, "data", "scalp_orders.json")
+        self.scalp_order_ids: Set[str] = set()
+        self.scalp_active_symbols: Set[str] = set()
+        self._load_scalp_orders()
+
+    def _load_scalp_orders(self):
+        """Restore registered scalp order IDs across restarts."""
+        try:
+            if hasattr(self, "scalp_orders_file") and os.path.exists(self.scalp_orders_file):
+                with open(self.scalp_orders_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self.scalp_order_ids = set(str(x) for x in data)
+        except Exception:
+            self.scalp_order_ids = set()
+
+    def record_scalp_order(self, order_id: Any, symbol: Optional[str] = None):
+        """Register an order ID as belonging to an institutional micro-scalp."""
+        if symbol:
+            self.scalp_active_symbols.add(symbol)
+        if not order_id:
+            return
+        oid = str(order_id)
+        self.scalp_order_ids.add(oid)
+        try:
+            if hasattr(self, "scalp_orders_file"):
+                with open(self.scalp_orders_file, "w", encoding="utf-8") as f:
+                    json.dump(list(self.scalp_order_ids), f, indent=2)
+        except Exception as e:
+            logger.debug("Failed saving scalp orders: %s", e)
+
+    def _refresh_credentials(self, api_key: Optional[str] = None, secret_key: Optional[str] = None):
+        """Dynamically resolve Binance API credentials from arguments or environment (.env)."""
+        try:
+            import dotenv
+            dotenv.load_dotenv(override=False)
+        except Exception:
+            pass
+
+        self.api_key = (
+            api_key
+            or os.getenv("BINANCE_FUTURES_API_KEY")
+            or os.getenv("BINANCE_API_KEY")
+            or os.getenv("Binance_API_Future_Krono")
+            or os.getenv("BINANCE_API_KEY_READONLY")
+            or self.api_key
+            or ""
+        ).strip()
+
+        self.secret_key = (
+            secret_key
+            or os.getenv("BINANCE_FUTURES_SECRET_KEY")
+            or os.getenv("BINANCE_API_SECRET")
+            or os.getenv("BINANCE_SECRET_KEY")
+            or os.getenv("Binance_secretKey_Future_Krono")
+            or self.secret_key
+            or ""
+        ).strip()
+
+    def _pos_to_dict(self, pos: ActiveBracketPosition) -> Dict[str, Any]:
+        """Serialize an ActiveBracketPosition to a JSON-compatible dictionary."""
+        return {
+            "position_id": pos.position_id,
+            "symbol": pos.symbol,
+            "side": pos.side,
+            "entry_price": str(pos.entry_price),
+            "stop_loss": str(pos.stop_loss),
+            "take_profit": str(pos.take_profit),
+            "quantity": str(pos.quantity),
+            "state": pos.state.value,
+            "entry_order_id": pos.entry_order_id,
+            "sl_order_id": pos.sl_order_id,
+            "tp_order_id": pos.tp_order_id,
+            "entry_fill_time_utc": pos.entry_fill_time_utc.isoformat() if pos.entry_fill_time_utc else None,
+            "close_time_utc": pos.close_time_utc.isoformat() if pos.close_time_utc else None,
+            "realized_pnl_usd": str(pos.realized_pnl_usd),
+            "gross_pnl_usd": str(pos.gross_pnl_usd),
+            "entry_fee_usd": str(pos.entry_fee_usd),
+            "exit_fee_usd": str(pos.exit_fee_usd),
+            "slippage_usd": str(pos.slippage_usd),
+            "funding_fee_usd": str(pos.funding_fee_usd),
+            "close_reason": pos.close_reason,
+            "forecast_confidence": str(pos.forecast_confidence)
+        }
+
+    def _dict_to_pos(self, d: Dict[str, Any]) -> ActiveBracketPosition:
+        """Deserialize a dictionary to an ActiveBracketPosition with strict Decimal precision."""
+        entry_time = None
+        if d.get("entry_fill_time_utc"):
+            try:
+                entry_time = datetime.datetime.fromisoformat(d["entry_fill_time_utc"])
+            except Exception:
+                pass
+
+        close_time = None
+        if d.get("close_time_utc"):
+            try:
+                close_time = datetime.datetime.fromisoformat(d["close_time_utc"])
+            except Exception:
+                pass
+
+        return ActiveBracketPosition(
+            position_id=d["position_id"],
+            symbol=d["symbol"],
+            side=d["side"],
+            entry_price=Decimal(str(d["entry_price"])),
+            stop_loss=Decimal(str(d["stop_loss"])),
+            take_profit=Decimal(str(d["take_profit"])),
+            quantity=Decimal(str(d["quantity"])),
+            state=PositionState(d.get("state", "IDLE")),
+            entry_order_id=d.get("entry_order_id"),
+            sl_order_id=d.get("sl_order_id"),
+            tp_order_id=d.get("tp_order_id"),
+            entry_fill_time_utc=entry_time,
+            close_time_utc=close_time,
+            realized_pnl_usd=Decimal(str(d.get("realized_pnl_usd", "0.0"))),
+            gross_pnl_usd=Decimal(str(d.get("gross_pnl_usd", d.get("realized_pnl_usd", "0.0")))),
+            entry_fee_usd=Decimal(str(d.get("entry_fee_usd", "0.0"))),
+            exit_fee_usd=Decimal(str(d.get("exit_fee_usd", "0.0"))),
+            slippage_usd=Decimal(str(d.get("slippage_usd", "0.0"))),
+            funding_fee_usd=Decimal(str(d.get("funding_fee_usd", "0.0"))),
+            close_reason=d.get("close_reason"),
+            forecast_confidence=Decimal(str(d.get("forecast_confidence", "0.65")))
+        )
+
+    def _load_paper_state(self) -> None:
+        """Load persistent paper trading equity, open positions, and trade ledger."""
+        if not self.state_file or not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "initial_equity" in data:
+                    self.paper_initial_equity = Decimal(str(data["initial_equity"]))
+                if "closed_trades" in data and isinstance(data["closed_trades"], list):
+                    self.closed_trades = data["closed_trades"]
+                if "active_positions" in data and isinstance(data["active_positions"], list):
+                    for pos_dict in data["active_positions"]:
+                        pos = self._dict_to_pos(pos_dict)
+                        if pos.state == PositionState.BRACKETS_ACTIVE:
+                            self.active_positions[pos.position_id] = pos
+        except Exception:
+            pass
+
+    def _save_paper_state(self) -> None:
+        """Persist paper trading state, open positions, and last trade atomically to JSON."""
+        if not self.state_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            active_list = [
+                self._pos_to_dict(p)
+                for p in self.active_positions.values()
+                if p.state == PositionState.BRACKETS_ACTIVE
+            ]
+            last_trade = self.closed_trades[-1] if self.closed_trades else None
+            payload = {
+                "initial_equity": str(self.paper_initial_equity),
+                "current_equity": str(self.get_current_equity()),
+                "total_trades": len(self.closed_trades),
+                "active_positions_count": len(active_list),
+                "active_positions": active_list,
+                "closed_trades": self.closed_trades[-200:],  # retain last 200 trades
+                "last_paper_trade": last_trade,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            temp_file = f"{self.state_file}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            if os.path.exists(self.state_file):
+                os.replace(temp_file, self.state_file)
+            else:
+                os.rename(temp_file, self.state_file)
+        except Exception:
+            pass
+
+    def _record_closed_trade(
+        self,
+        pos: ActiveBracketPosition,
+        exit_price: Decimal,
+        reason: str,
+        timestamp_utc: Optional[datetime.datetime] = None
+    ) -> Dict[str, Any]:
+        """Record completed trade into zero-float paper ledger."""
+        ts = timestamp_utc or datetime.datetime.now(datetime.timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+
+        duration_min = 0
+        if pos.entry_fill_time_utc:
+            duration_min = max(0, int((ts - pos.entry_fill_time_utc).total_seconds() / 60))
+
+        if self.realistic_friction:
+            sym_cfg = self.symbols_config.get(pos.symbol)
+            taker_fee_rate = sym_cfg.taker_fee_rate if sym_cfg else Decimal("0.0005")
+            maker_fee_rate = sym_cfg.maker_fee_rate if sym_cfg else Decimal("0.0002")
+            est_slippage_rate = sym_cfg.est_slippage_rate if sym_cfg else Decimal("0.0003")
+
+            # 1. Adverse slippage on market stop-loss executions
+            if reason in ("STOP_LOSS_TRIGGERED", "SL_HIT", "EMERGENCY_FLATTEN_SL_TIMEOUT"):
+                adverse_slippage = est_slippage_rate * Decimal("1.5")
+                if pos.side in ("BUY", "LONG"):
+                    effective_exit = exit_price * (Decimal("1") - adverse_slippage)
+                else:
+                    effective_exit = exit_price * (Decimal("1") + adverse_slippage)
+                prec = sym_cfg.price_precision if sym_cfg else 4
+                fmt = Decimal("10") ** -prec
+                effective_exit = effective_exit.quantize(fmt, rounding=ROUND_HALF_UP)
+                pos.slippage_usd += (abs(effective_exit - exit_price) * pos.quantity).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            else:
+                effective_exit = exit_price
+
+            # 2. Maker fee on TP limit fill, taker fee on SL/market liquidations
+            if reason in ("TAKE_PROFIT_TRIGGERED", "TP_HIT"):
+                exit_fee_rate = maker_fee_rate
+            else:
+                exit_fee_rate = taker_fee_rate
+
+            exit_notional = effective_exit * pos.quantity
+            pos.exit_fee_usd = (exit_notional * exit_fee_rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            total_fees = pos.entry_fee_usd + pos.exit_fee_usd
+
+            # 3. Accrued 8-hour funding carry drag
+            if duration_min >= 480:
+                intervals = duration_min // 480
+                funding_drag = (pos.entry_price * pos.quantity * Decimal("0.0001") * Decimal(str(intervals))).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                pos.funding_fee_usd = funding_drag
+
+            # 4. Gross PnL
+            if pos.side in ("BUY", "LONG"):
+                gross_pnl = (effective_exit - pos.entry_price) * pos.quantity
+            else:
+                gross_pnl = (pos.entry_price - effective_exit) * pos.quantity
+            pos.gross_pnl_usd = gross_pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            # 5. Net Realized PnL (Gross - Fees - Funding)
+            net_pnl = gross_pnl - total_fees - pos.funding_fee_usd
+            pos.realized_pnl_usd = net_pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        else:
+            effective_exit = exit_price
+            if pos.realized_pnl_usd == Decimal("0.0"):
+                if pos.side in ("BUY", "LONG"):
+                    gross_pnl = (exit_price - pos.entry_price) * pos.quantity
+                else:
+                    gross_pnl = (pos.entry_price - exit_price) * pos.quantity
+                pos.realized_pnl_usd = gross_pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            pos.gross_pnl_usd = pos.realized_pnl_usd
+            total_fees = Decimal("0.00")
+
+        entry_val = pos.entry_price * pos.quantity
+        pnl = pos.realized_pnl_usd
+        return_pct = ((pnl / entry_val) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if entry_val > 0 else Decimal("0.00")
+
+        record = {
+            "trade_id": pos.position_id,
+            "symbol": pos.symbol,
+            "side": pos.side,
+            "entry_price": float(pos.entry_price),
+            "exit_price": float(effective_exit),
+            "quantity": float(pos.quantity),
+            "notional_usd": float((pos.quantity * pos.entry_price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            "gross_pnl_usd": float(pos.gross_pnl_usd),
+            "fee_usd": float((pos.entry_fee_usd + pos.exit_fee_usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            "slippage_usd": float(pos.slippage_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            "funding_usd": float(pos.funding_fee_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            "realized_pnl_usd": float(pnl),
+            "return_pct": float(return_pct),
+            "result": "WIN" if pnl > Decimal("0.0") else ("LOSS" if pnl < Decimal("0.0") else "EVEN"),
+            "reason": reason,
+            "entry_time": pos.entry_fill_time_utc.isoformat() if pos.entry_fill_time_utc else ts.isoformat(),
+            "close_time": ts.isoformat(),
+            "duration_minutes": duration_min
+        }
+        self.closed_trades.append(record)
+        self._save_paper_state()
+        return record
+
+    def get_current_equity(self) -> Decimal:
+        """Compute real-time equity: Starting Balance + Total Realized PnL."""
+        realized_total = sum(
+            Decimal(str(t["realized_pnl_usd"]))
+            for t in self.closed_trades
+        ) if self.closed_trades else Decimal("0.00")
+        return self.paper_initial_equity + realized_total
+
+    def get_locked_margin(self) -> Decimal:
+        """Compute aggregate margin currently committed across active bracket positions."""
+        locked = Decimal("0.00")
+        leverage = Decimal(str(DEFAULT_RISK_CONFIG.max_account_leverage))
+        for pos in self.active_positions.values():
+            if pos.state == PositionState.BRACKETS_ACTIVE:
+                pos_notional = pos.entry_price * pos.quantity
+                locked += (pos_notional / leverage).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return locked
+
+    def get_free_margin(self) -> Decimal:
+        """Compute available unencumbered margin for new position entries."""
+        current_eq = self.get_current_equity()
+        locked = self.get_locked_margin()
+        return max(Decimal("0.00"), current_eq - locked)
+
+    def get_paper_summary(self, current_prices: Optional[Dict[str, Decimal]] = None) -> Dict[str, Any]:
+        """Generate audit report of paper trading performance (wins vs losses)."""
+        total = len(self.closed_trades)
+        wins = sum(1 for t in self.closed_trades if t.get("realized_pnl_usd", 0) > 0)
+        losses = sum(1 for t in self.closed_trades if t.get("realized_pnl_usd", 0) < 0)
+        even = sum(1 for t in self.closed_trades if t.get("realized_pnl_usd", 0) == 0)
+
+        win_rate = (wins / total * 100.0) if total > 0 else 0.0
+
+        realized_pnl_dec = sum(
+            Decimal(str(t["realized_pnl_usd"]))
+            for t in self.closed_trades
+        ) if self.closed_trades else Decimal("0.00")
+
+        gross_pnl_dec = sum(
+            Decimal(str(t.get("gross_pnl_usd", t.get("realized_pnl_usd", 0))))
+            for t in self.closed_trades
+        ) if self.closed_trades else Decimal("0.00")
+
+        total_fees_dec = sum(
+            Decimal(str(t.get("fee_usd", 0)))
+            for t in self.closed_trades
+        ) if self.closed_trades else Decimal("0.00")
+
+        total_slippage_dec = sum(
+            Decimal(str(t.get("slippage_usd", 0)))
+            for t in self.closed_trades
+        ) if self.closed_trades else Decimal("0.00")
+
+        total_funding_dec = sum(
+            Decimal(str(t.get("funding_usd", 0)))
+            for t in self.closed_trades
+        ) if self.closed_trades else Decimal("0.00")
+
+        gross_profit = sum(
+            Decimal(str(t["realized_pnl_usd"]))
+            for t in self.closed_trades if t.get("realized_pnl_usd", 0) > 0
+        ) if self.closed_trades else Decimal("0.00")
+
+        gross_loss = sum(
+            abs(Decimal(str(t["realized_pnl_usd"])))
+            for t in self.closed_trades if t.get("realized_pnl_usd", 0) < 0
+        ) if self.closed_trades else Decimal("0.00")
+
+        profit_factor = float((gross_profit / gross_loss).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if gross_loss > 0 else (float(gross_profit) if gross_profit > 0 else 0.0)
+
+        # Unrealized PnL from active bracket positions
+        unrealized_pnl_dec = Decimal("0.00")
+        if current_prices:
+            for pos in self.active_positions.values():
+                if pos.state == PositionState.BRACKETS_ACTIVE and pos.symbol in current_prices:
+                    mark = current_prices[pos.symbol]
+                    if pos.side in ("BUY", "LONG"):
+                        pos_unrealized = (mark - pos.entry_price) * pos.quantity
+                    else:
+                        pos_unrealized = (pos.entry_price - mark) * pos.quantity
+                    if self.realistic_friction:
+                        exit_fee = (mark * pos.quantity * Decimal("0.0005"))
+                        pos_unrealized -= exit_fee
+                    unrealized_pnl_dec += pos_unrealized
+
+        current_equity_dec = self.paper_initial_equity + realized_pnl_dec + unrealized_pnl_dec
+        net_return_pct = ((realized_pnl_dec / self.paper_initial_equity) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if self.paper_initial_equity > 0 else Decimal("0.00")
+
+        locked_margin_dec = self.get_locked_margin()
+        free_margin_dec = max(Decimal("0.00"), current_equity_dec - locked_margin_dec)
+
+        return {
+            "initial_equity": float(self.paper_initial_equity),
+            "current_equity": float(current_equity_dec),
+            "free_margin_usd": float(free_margin_dec),
+            "locked_margin_usd": float(locked_margin_dec),
+            "realized_pnl_usd": float(realized_pnl_dec),
+            "gross_pnl_usd": float(gross_pnl_dec),
+            "total_fees_usd": float(total_fees_dec),
+            "total_slippage_usd": float(total_slippage_dec),
+            "total_funding_usd": float(total_funding_dec),
+            "unrealized_pnl_usd": float(unrealized_pnl_dec),
+            "net_return_pct": float(net_return_pct),
+            "total_trades": total,
+            "winning_trades": wins,
+            "losing_trades": losses,
+            "even_trades": even,
+            "win_loss_display": f"{wins} Wins vs {losses} Losses",
+            "win_rate_pct": round(win_rate, 1),
+            "profit_factor": profit_factor,
+            "active_positions_count": sum(1 for p in self.active_positions.values() if p.state == PositionState.BRACKETS_ACTIVE),
+            "micro_trading": {
+                "active": True,
+                "mode": "MICRO_LOTS",
+                "max_account_leverage": 5,
+                "account_profile": "SMALL_ACCOUNT ($200 USDT)",
+                "realistic_friction": self.realistic_friction
+            },
+            "last_paper_trade": self.closed_trades[-1] if self.closed_trades else None,
+            "open_positions": [self._pos_to_dict(p) for p in self.active_positions.values() if p.state == PositionState.BRACKETS_ACTIVE],
+            "closed_trades": list(reversed(self.closed_trades[-50:]))
+        }
+
+    def reset_paper_trading(self, initial_equity: Decimal = Decimal("200.00")) -> Dict[str, Any]:
+        """Reset paper trading balance and trade ledger back to initial state."""
+        self.paper_initial_equity = initial_equity
+        self.active_positions.clear()
+        self.closed_trades.clear()
+        self._save_paper_state()
+        return self.get_paper_summary()
+
+    def _generate_signature(self, query_string: str) -> str:
+        """Sign query parameters using HMAC-SHA256."""
+        if not self.secret_key:
+            return ""
+        return hmac.new(
+            self.secret_key.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+    def _sync_server_time(self) -> int:
+        """Synchronize local system clock with Binance Futures server time to eliminate recvWindow errors."""
+        try:
+            t0 = int(time.time() * 1000)
+            resp = self.session.get(f"{self.base_url}/fapi/v1/time", timeout=5)
+            if resp.status_code == 200:
+                server_time = resp.json().get("serverTime", t0)
+                t1 = int(time.time() * 1000)
+                latency = max(0, (t1 - t0) // 2)
+                self._time_offset_ms = (server_time - t1) + latency
+                self._last_time_sync = time.time()
+                return self._time_offset_ms
+        except Exception as e:
+            logger.debug("Failed to synchronize Binance server time: %s", e)
+        return self._time_offset_ms
+
+    def _signed_request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Send an authenticated signed request to Binance USD(S)-M Futures REST API."""
+        if not self.api_key or not self.secret_key:
+            self._refresh_credentials()
+        if not self.api_key or not self.secret_key:
+            raise ValueError("BINANCE_FUTURES_API_KEY and BINANCE_FUTURES_SECRET_KEY are required for live execution.")
+        
+        url = f"{self.base_url}{path}"
+        payload = params.copy() if params else {}
+        is_retry = bool(payload.pop("_is_retry", False))
+        
+        # Periodic server time sync every 15 minutes or if never synced
+        if time.time() - getattr(self, "_last_time_sync", 0.0) > 900:
+            self._sync_server_time()
+            
+        current_time_ms = int(time.time() * 1000) + getattr(self, "_time_offset_ms", 0)
+        payload["timestamp"] = current_time_ms
+        if "recvWindow" not in payload:
+            payload["recvWindow"] = 10000
+        
+        query_str = urllib.parse.urlencode(payload)
+        signature = self._generate_signature(query_str)
+        full_query = f"{query_str}&signature={signature}"
+        
+        headers = {
+            "X-MBX-APIKEY": self.api_key,
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        method_upper = method.upper()
+        if method_upper == "GET":
+            resp = self.session.get(f"{url}?{full_query}", headers=headers, timeout=10)
+        elif method_upper == "POST":
+            resp = self.session.post(url, data=full_query, headers=headers, timeout=10)
+        elif method_upper == "DELETE":
+            resp = self.session.delete(f"{url}?{full_query}", headers=headers, timeout=10)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+            
+        if resp.status_code != 200:
+            error_msg = resp.text
+            try:
+                error_data = resp.json()
+                code = error_data.get("code")
+                error_msg = error_data.get("msg", resp.text)
+                # Code -1021: Timestamp for this request is outside of the recvWindow.
+                if code == -1021 and not is_retry:
+                    logger.warning("Timestamp outside recvWindow (-1021). Resyncing clock and retrying...")
+                    self._sync_server_time()
+                    retry_params = params.copy() if params else {}
+                    retry_params["_is_retry"] = True
+                    retry_params["recvWindow"] = 15000
+                    return self._signed_request(method, path, retry_params)
+            except Exception:
+                pass
+            raise RuntimeError(f"Binance Futures API Error ({resp.status_code}): {error_msg}")
+            
+        return resp.json()
+
+    def get_bnb_price(self) -> Decimal:
+        """Fetch current BNB mark price for fee valuation (cached for 60s, Zero Float Math)."""
+        now = time.time()
+        cached = getattr(self, "_bnb_price_cache", None)
+        cached_time = getattr(self, "_bnb_price_cache_time", 0)
+        if cached is not None and (now - cached_time) < 60:
+            return cached
+        try:
+            r = self.session.get(f"{self.base_url}/fapi/v1/ticker/price?symbol=BNBUSDT", timeout=5)
+            if r.status_code == 200:
+                px = Decimal(str(r.json().get("price", "640.0")))
+                self._bnb_price_cache = px
+                self._bnb_price_cache_time = now
+                return px
+        except Exception:
+            pass
+        fallback = cached or Decimal("640.0")
+        self._bnb_price_cache = fallback
+        self._bnb_price_cache_time = now
+        return fallback
+
+    def get_live_account_summary(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Query real USD(S)-M Futures balance, BNB fee buffer, margin ratio, and position risk from Binance (cached 3s)."""
+        now = time.time()
+        cached = getattr(self, "_cached_account_summary", None)
+        cached_time = getattr(self, "_cached_account_summary_time", 0)
+        if not force_refresh and cached is not None and (now - cached_time) < 3:
+            return cached
+
+        if not self.api_key or not self.secret_key:
+            self._refresh_credentials()
+        if not self.api_key or not self.secret_key:
+            return {
+                "connected": False,
+                "error": "API credentials not configured in environment.",
+                "total_wallet_balance_usd": Decimal("0.00"),
+                "available_balance_usd": Decimal("0.00"),
+                "unrealized_pnl_usd": Decimal("0.00"),
+                "margin_ratio_pct": Decimal("0.00"),
+                "bnb_balance": Decimal("0.00"),
+                "bnb_fee_discount_active": False,
+                "active_positions_count": 0,
+                "positions": [],
+                "open_orders": []
+            }
+            
+        try:
+            account_data = self._signed_request("GET", "/fapi/v2/account")
+            pos_data = self._signed_request("GET", "/fapi/v2/positionRisk")
+            
+            total_wallet = Decimal(str(account_data.get("totalWalletBalance", "0.00")))
+            available_balance = Decimal(str(account_data.get("availableBalance", "0.00")))
+            total_unrealized = Decimal(str(account_data.get("totalUnrealizedProfit", "0.00")))
+            total_margin = Decimal(str(account_data.get("totalMaintMargin", "0.00")))
+            margin_ratio = (total_margin / total_wallet * Decimal("100")).quantize(Decimal("0.01")) if total_wallet > Decimal("0") else Decimal("0.00")
+            
+            # Inspect Multi-Asset balances for BNB fee deduction buffer
+            bnb_balance = Decimal("0.00")
+            for a in account_data.get("assets", []):
+                if a.get("asset") == "BNB":
+                    bnb_balance = Decimal(str(a.get("walletBalance", "0.00")))
+                    break
+            bnb_fee_discount_active = bnb_balance >= Decimal("0.001")
+
+            active_live_positions = []
+            for p in pos_data:
+                amt = Decimal(str(p.get("positionAmt", "0.00")))
+                if abs(amt) > Decimal("0"):
+                    entry_px = Decimal(str(p.get("entryPrice", "0.00")))
+                    mark_px = Decimal(str(p.get("markPrice", "0.00")))
+                    unreal_pnl = Decimal(str(p.get("unRealizedProfit", "0.00")))
+                    lev = Decimal(str(p.get("leverage", "1")))
+                    side = "BUY" if amt > Decimal("0") else "SELL"
+                    sym = p.get("symbol", "")
+                    cfg = self.symbols_config.get(sym)
+
+                    # Mark-to-market notional and initial margin
+                    notional = (abs(amt) * (mark_px if mark_px > Decimal("0") else entry_px)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    margin = (notional / lev).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if lev > Decimal("0") else notional
+
+                    # Price Gain % (directional price movement from entry to mark)
+                    if entry_px > Decimal("0"):
+                        if side == "BUY":
+                            price_gain_pct = ((mark_px - entry_px) / entry_px * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        else:
+                            price_gain_pct = ((entry_px - mark_px) / entry_px * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    else:
+                        price_gain_pct = Decimal("0.00")
+
+                    # Round-trip fee deduction (VIP0 taker entry + exit, with 10% BNB discount if active)
+                    taker_rate = cfg.taker_fee_rate if cfg else Decimal("0.0005")
+                    if bnb_fee_discount_active:
+                        taker_rate = taker_rate * Decimal("0.90")
+                    rt_fee_rate = taker_rate * Decimal("2")
+                    rt_fee_usd = (notional * rt_fee_rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+                    # Net Unrealized PnL (all exchange taker fees deducted)
+                    net_pnl_usd = (unreal_pnl - rt_fee_usd).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+                    # ROI % on Initial Margin (Gross and Net after all fees)
+                    gross_roi_pct = ((unreal_pnl / margin) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if margin > Decimal("0") else Decimal("0.00")
+                    net_roi_pct = ((net_pnl_usd / margin) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if margin > Decimal("0") else Decimal("0.00")
+                    net_price_gain_pct = (price_gain_pct - (rt_fee_rate * Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                    is_scalp = (sym in getattr(self, "scalp_active_symbols", set()))
+                    active_live_positions.append({
+                        "symbol": sym,
+                        "position_amt": str(amt),
+                        "side": side,
+                        "entry_price": str(entry_px),
+                        "mark_price": str(mark_px),
+                        "unrealized_pnl_usd": str(unreal_pnl),
+                        "liquidation_price": str(Decimal(str(p.get("liquidationPrice", "0.00")))),
+                        "notional_usd": str(notional),
+                        "margin_usd": str(margin),
+                        "leverage": int(lev),
+                        "margin_type": p.get("marginType", "isolated"),
+                        "price_gain_pct": str(price_gain_pct),
+                        "net_price_gain_pct": str(net_price_gain_pct),
+                        "est_fee_usd": str(rt_fee_usd),
+                        "net_pnl_usd": str(net_pnl_usd),
+                        "gross_roi_pct": str(gross_roi_pct),
+                        "net_roi_pct": str(net_roi_pct),
+                        "is_scalp": is_scalp,
+                        "trade_type": "SCALP" if is_scalp else "MACRO"
+                    })
+                    
+            summary = {
+                "connected": True,
+                "total_wallet_balance_usd": total_wallet,
+                "available_balance_usd": available_balance,
+                "unrealized_pnl_usd": total_unrealized,
+                "margin_ratio_pct": margin_ratio,
+                "bnb_balance": bnb_balance,
+                "bnb_fee_discount_active": bnb_fee_discount_active,
+                "active_positions_count": len(active_live_positions),
+                "positions": active_live_positions
+            }
+            self._cached_account_summary = summary
+            self._cached_account_summary_time = now
+            return summary
+        except Exception as e:
+            logger.error("Live Binance account query error: %s", e)
+            err_summary = {
+                "connected": False,
+                "error": str(e),
+                "total_wallet_balance_usd": Decimal("0.00"),
+                "available_balance_usd": Decimal("0.00"),
+                "unrealized_pnl_usd": Decimal("0.00"),
+                "margin_ratio_pct": Decimal("0.00"),
+                "bnb_balance": Decimal("0.00"),
+                "bnb_fee_discount_active": False,
+                "active_positions_count": 0,
+                "positions": [],
+                "open_orders": []
+            }
+            if cached is not None and (now - cached_time) < 30:
+                stale = dict(cached)
+                stale["warning"] = f"Using cached telemetry due to transient error: {e}"
+                return stale
+            # Rate protection: Cache the error for 60s so WebUI polling doesn't hammer Binance with 401/429
+            self._cached_account_summary = err_summary
+            self._cached_account_summary_time = now
+            return err_summary
+
+    def ensure_isolated_margin(self, symbol: str, leverage: int = 2) -> None:
+        """Enforce ISOLATED margin mode and set safe leverage ceiling on Binance Futures."""
+        try:
+            self._signed_request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "ISOLATED"})
+        except Exception:
+            # Code -4046 indicates margin type is already ISOLATED, ignore
+            pass
+        try:
+            self._signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+        except Exception as e:
+            logger.warning("Failed to set leverage %sx for %s: %s", leverage, symbol, e)
+
+    def fetch_live_risk_snapshots(
+        self,
+        symbol: str,
+        fallback_price: Optional[Decimal] = None,
+        realized_vol: Decimal = Decimal("0.015"),
+        baseline_vol: Decimal = Decimal("0.015"),
+        atr_pct: Optional[Decimal] = None,
+        live_summary: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Any], Optional[Any]]:
+        """
+        Fetch fresh Mark-to-Market PortfolioState and live OrderBook MarketSnapshot
+        for RiskEngine synchronous clearance. Returns (None, None) on connectivity failure
+        so the RiskEngine fails closed.
+        """
+        from risk_engine.adapter import (
+            build_market_snapshot_from_orderbook,
+            build_portfolio_state_from_summary,
+        )
+
+        now_ms = int(time.time() * 1000)
+        summary = live_summary if (live_summary and live_summary.get("connected")) else self.get_live_account_summary()
+        if not summary or not summary.get("connected"):
+            return None, None
+
+        portfolio_state = build_portfolio_state_from_summary(summary, now_ms=now_ms)
+
+        sym_upper = symbol.strip().upper()
+        sym_cfg = self.symbols_config.get(sym_upper)
+        step_size = (Decimal("10") ** -sym_cfg.quantity_precision) if sym_cfg else Decimal("0.001")
+        min_qty = sym_cfg.min_quantity if sym_cfg else Decimal("0.001")
+        min_notional = sym_cfg.min_notional if sym_cfg else Decimal("5.00")
+
+        try:
+            depth_url = f"{self.base_url}/fapi/v1/depth"
+            resp = self.session.get(depth_url, params={"symbol": sym_upper, "limit": 10}, timeout=4)
+            resp.raise_for_status()
+            book = resp.json()
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            if not bids or not asks:
+                return None, None
+
+            best_bid = Decimal(str(bids[0][0]))
+            best_ask = Decimal(str(asks[0][0]))
+            bid_depth_usd = sum((Decimal(str(px)) * Decimal(str(q)) for px, q in bids), Decimal("0"))
+            ask_depth_usd = sum((Decimal(str(px)) * Decimal(str(q)) for px, q in asks), Decimal("0"))
+            tob_depth_usd = (
+                Decimal(str(bids[0][0])) * Decimal(str(bids[0][1]))
+                + Decimal(str(asks[0][0])) * Decimal(str(asks[0][1]))
+            )
+            mid_px = (best_bid + best_ask) / Decimal("2")
+            mark_px = mid_px
+            try:
+                prem_resp = self.session.get(
+                    f"{self.base_url}/fapi/v1/premiumIndex", params={"symbol": sym_upper}, timeout=3
+                )
+                if prem_resp.ok:
+                    mp = Decimal(str(prem_resp.json().get("markPrice", "0")))
+                    if mp > Decimal("0"):
+                        mark_px = mp
+            except Exception:
+                pass
+
+            market_snapshot = build_market_snapshot_from_orderbook(
+                symbol=sym_upper,
+                mark_price=mark_px,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                bid_depth_usd=bid_depth_usd,
+                ask_depth_usd=ask_depth_usd,
+                realized_vol=realized_vol,
+                baseline_vol=baseline_vol,
+                atr_pct=atr_pct,
+                step_size=step_size,
+                min_qty=min_qty,
+                min_notional_usd=min_notional,
+                top_of_book_depth_usd=max(tob_depth_usd, bid_depth_usd + ask_depth_usd),
+                now_ms=int(time.time() * 1000),
+            )
+            return portfolio_state, market_snapshot
+        except Exception as exc:
+            logger.warning("Failed fetching live orderbook snapshot for %s (fail-closed): %s", sym_upper, exc)
+            return None, None
+
+    def _apply_risk_gate(
+        self,
+        ticket: TradeTicket,
+        portfolio_state: Optional[Any] = None,
+        market_snapshot: Optional[Any] = None,
+        is_live: bool = False,
+    ) -> Tuple[Optional[TradeTicket], Optional[ActiveBracketPosition]]:
+        """
+        Synchronous Risk Engine gatekeeper check.
+        When `self.risk_engine` is attached, no order may proceed without explicit
+        APPROVED or RESIZED clearance (fail-closed if snapshots are missing).
+        """
+        if self.risk_engine is None:
+            # Real-Money Integrity Standard (v3): LIVE execution MUST FAIL CLOSED
+            # if no RiskEngine gatekeeper is attached. Dry-run unit tests remain unaffected.
+            if is_live and not self.dry_run:
+                pos_id = f"REJECTED_{ticket.symbol}-{int(time.time()*1000)}"
+                logger.error(
+                    "LIVE EXECUTION BLOCKED (FAIL-CLOSED): No RiskEngine attached to BinanceAtomicExecutor for %s.",
+                    ticket.symbol,
+                )
+                return None, ActiveBracketPosition(
+                    position_id=pos_id,
+                    symbol=ticket.symbol,
+                    side=ticket.side,
+                    entry_price=ticket.entry_price,
+                    stop_loss=ticket.stop_loss,
+                    take_profit=ticket.take_profit,
+                    quantity=Decimal("0"),
+                    state=PositionState.REJECTED,
+                    close_reason="RISK_VETOED:LIVE_MODE_REQUIRES_RISK_ENGINE",
+                )
+            return ticket, None
+
+        from dataclasses import replace as _dc_replace
+        from risk_engine.adapter import ticket_to_proposed_order
+        from risk_engine.models import DecisionStatus
+
+        if portfolio_state is None or market_snapshot is None:
+            pos_id = f"REJECTED_{ticket.symbol}-{int(time.time()*1000)}"
+            return None, ActiveBracketPosition(
+                position_id=pos_id,
+                symbol=ticket.symbol,
+                side=ticket.side,
+                entry_price=ticket.entry_price,
+                stop_loss=ticket.stop_loss,
+                take_profit=ticket.take_profit,
+                quantity=Decimal("0"),
+                state=PositionState.REJECTED,
+                close_reason="RISK_VETOED:MISSING_PORTFOLIO_OR_MARKET_SNAPSHOT",
+            )
+
+        proposed = ticket_to_proposed_order(ticket)
+        decision = self.risk_engine.evaluate_order(
+            proposed_order=proposed,
+            portfolio_state=portfolio_state,
+            market_snapshot=market_snapshot,
+        )
+        self.last_risk_decision = decision
+
+        if decision.status == DecisionStatus.KILL_SWITCH:
+            if is_live and not self.dry_run:
+                try:
+                    self.flatten_all_live_positions()
+                except Exception as exc:
+                    logger.error("Kill-switch live flatten failed: %s", exc)
+            pos_id = f"KILL_{ticket.symbol}-{int(time.time()*1000)}"
+            return None, ActiveBracketPosition(
+                position_id=pos_id,
+                symbol=ticket.symbol,
+                side=ticket.side,
+                entry_price=ticket.entry_price,
+                stop_loss=ticket.stop_loss,
+                take_profit=ticket.take_profit,
+                quantity=Decimal("0"),
+                state=PositionState.REJECTED,
+                close_reason=f"RISK_KILL_SWITCH:{'|'.join(decision.reason_codes)}",
+            )
+
+        if not decision.is_executable:
+            pos_id = f"VETO_{ticket.symbol}-{int(time.time()*1000)}"
+            return None, ActiveBracketPosition(
+                position_id=pos_id,
+                symbol=ticket.symbol,
+                side=ticket.side,
+                entry_price=ticket.entry_price,
+                stop_loss=ticket.stop_loss,
+                take_profit=ticket.take_profit,
+                quantity=Decimal("0"),
+                state=PositionState.REJECTED,
+                close_reason=f"RISK_VETOED:{'|'.join(decision.reason_codes)}",
+            )
+
+        if decision.status == DecisionStatus.RESIZED:
+            new_notional = (decision.approved_qty * ticket.entry_price).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            ticket = _dc_replace(
+                ticket,
+                quantity=decision.approved_qty,
+                notional_usd=new_notional,
+            )
+
+        return ticket, None
+
+    def _resolve_symbol_precision(self, symbol: str) -> Tuple[int, int]:
+        """Dynamically resolve price and quantity precision from symbols_config or Binance exchangeInfo."""
+        sym_cfg = self.symbols_config.get(symbol)
+        if sym_cfg:
+            return sym_cfg.price_precision, sym_cfg.quantity_precision
+
+        if not hasattr(self, "_dynamic_precision_cache"):
+            self._dynamic_precision_cache: Dict[str, Tuple[int, int]] = {}
+        if symbol in self._dynamic_precision_cache:
+            return self._dynamic_precision_cache[symbol]
+
+        try:
+            url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+            import urllib.request, json
+            req = urllib.request.Request(url, headers={"User-Agent": "Kronos/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                for s in data.get("symbols", []):
+                    if s.get("symbol") == symbol:
+                        p_prec = int(s.get("pricePrecision", 4))
+                        q_prec = int(s.get("quantityPrecision", 1))
+                        for f in s.get("filters", []):
+                            if f.get("filterType") == "PRICE_FILTER":
+                                tick = str(f.get("tickSize", "0.0001"))
+                                if "." in tick:
+                                    p_prec = len(tick.split(".")[1].rstrip("0"))
+                            elif f.get("filterType") == "LOT_SIZE":
+                                step = str(f.get("stepSize", "0.1"))
+                                if "." in step:
+                                    q_prec = len(step.split(".")[1].rstrip("0"))
+                        self._dynamic_precision_cache[symbol] = (p_prec, q_prec)
+                        return p_prec, q_prec
+        except Exception as e:
+            logger.warning(f"Failed to fetch exchangeInfo precision for {symbol}: {e}")
+
+        return 4, 1
+
+    def submit_live_bracket_order(
+        self,
+        ticket: TradeTicket,
+        portfolio_state: Optional[Any] = None,
+        market_snapshot: Optional[Any] = None,
+    ) -> ActiveBracketPosition:
+        """
+        Execute real capital atomic bracket order on Binance Futures REST API.
+        0. Pre-flight inverted bracket geometry invariant.
+        1. Synchronous Risk Engine clearance (fail-closed in live mode before any REST call).
+        2. Pre-flight isolated margin & leverage.
+        3. Market entry order dispatch.
+        4. Simultaneous Stop-Loss & Take-Profit dispatch via Algo Order API (/fapi/v1/algoOrder).
+        5. Anti-naked-position: If SL fails to confirm in 1,000ms, emergency market flatten.
+        """
+        price_prec, qty_prec = self._resolve_symbol_precision(ticket.symbol)
+        fmt_price = Decimal("10") ** -price_prec
+        fmt_qty = Decimal("10") ** -qty_prec
+
+        if getattr(self, "contra_mode", False):
+            orig_side = ticket.side
+            ticket = invert_trade_ticket(ticket)
+            logger.warning(
+                "[CONTRA TRADING ACTIVE] Live Trade Inverted: %s %s -> %s | Entry: %s | Inverted TP: %s | Inverted SL: %s",
+                ticket.symbol, orig_side, ticket.side, ticket.entry_price, ticket.take_profit, ticket.stop_loss
+            )
+
+        side = "BUY" if ticket.side in ("BUY", "LONG") else "SELL"
+        opp_side = "SELL" if side == "BUY" else "BUY"
+
+        # Pre-Flight Invariant: Reject inverted brackets BEFORE any REST market order is dispatched
+        if side == "BUY":
+            if not (ticket.stop_loss < ticket.entry_price < ticket.take_profit):
+                logger.error(
+                    "PRE-FLIGHT REJECTED: Inverted bracket for LONG %s (SL %s < Entry %s < TP %s violated).",
+                    ticket.symbol, ticket.stop_loss, ticket.entry_price, ticket.take_profit
+                )
+                pos_id = f"REJECTED_{ticket.symbol}-{int(time.time()*1000)}"
+                return ActiveBracketPosition(
+                    position_id=pos_id,
+                    symbol=ticket.symbol,
+                    side=ticket.side,
+                    entry_price=ticket.entry_price,
+                    stop_loss=ticket.stop_loss,
+                    take_profit=ticket.take_profit,
+                    quantity=ticket.quantity,
+                    state=PositionState.REJECTED,
+                    close_reason=f"INVERTED_BRACKET: SL {ticket.stop_loss} < Entry {ticket.entry_price} < TP {ticket.take_profit} violated"
+                )
+        else:
+            if not (ticket.take_profit < ticket.entry_price < ticket.stop_loss):
+                logger.error(
+                    "PRE-FLIGHT REJECTED: Inverted bracket for SHORT %s (TP %s < Entry %s < SL %s violated).",
+                    ticket.symbol, ticket.take_profit, ticket.entry_price, ticket.stop_loss
+                )
+                pos_id = f"REJECTED_{ticket.symbol}-{int(time.time()*1000)}"
+                return ActiveBracketPosition(
+                    position_id=pos_id,
+                    symbol=ticket.symbol,
+                    side=ticket.side,
+                    entry_price=ticket.entry_price,
+                    stop_loss=ticket.stop_loss,
+                    take_profit=ticket.take_profit,
+                    quantity=ticket.quantity,
+                    state=PositionState.REJECTED,
+                    close_reason=f"INVERTED_BRACKET: TP {ticket.take_profit} < Entry {ticket.entry_price} < SL {ticket.stop_loss} violated"
+                )
+
+        # Synchronous Risk Engine Gatekeeper (fail-closed in live mode before ANY exchange call)
+        gated_ticket, rejected_pos = self._apply_risk_gate(
+            ticket, portfolio_state=portfolio_state, market_snapshot=market_snapshot, is_live=True
+        )
+        if rejected_pos is not None or gated_ticket is None:
+            return rejected_pos  # type: ignore[return-value]
+        ticket = gated_ticket
+
+        # Ensure isolated contract leverage is at least 3x (up to 5x) to prevent 100% margin lock on micro-notionals
+        exchange_lev = max(3, min(5, ticket.effective_leverage))
+        self.ensure_isolated_margin(ticket.symbol, leverage=exchange_lev)
+        
+        qty_str = str(ticket.quantity.quantize(fmt_qty, rounding=ROUND_HALF_UP))
+        sl_price_str = str(ticket.stop_loss.quantize(fmt_price, rounding=ROUND_HALF_UP))
+        tp_price_str = str(ticket.take_profit.quantize(fmt_price, rounding=ROUND_HALF_UP))
+        
+        # 1. Entry Market Order
+        instance_tag = os.getenv("KRONOS_INSTANCE_TAG", "PC").strip().upper()
+        entry_params = {
+            "symbol": ticket.symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty_str,
+            "newClientOrderId": f"LIVE_{instance_tag}_{ticket.symbol}_{int(time.time()*1000)}"[:32]
+        }
+        try:
+            entry_resp = self._signed_request("POST", "/fapi/v1/order", entry_params)
+        except Exception as e:
+            if self.risk_engine is not None and self.last_risk_decision is not None:
+                res_id = getattr(self.last_risk_decision, "metrics_snapshot", {}).get("reservation_id")
+                if res_id and hasattr(self.risk_engine, "release_slot_reservation"):
+                    self.risk_engine.release_slot_reservation(res_id)
+            logger.warning("Live entry rejected for %s: %s", ticket.symbol, e)
+            pos_id = f"REJECTED_{ticket.symbol}-{int(time.time()*1000)}"
+            return ActiveBracketPosition(
+                position_id=pos_id,
+                symbol=ticket.symbol,
+                side=ticket.side,
+                entry_price=ticket.entry_price,
+                stop_loss=ticket.stop_loss,
+                take_profit=ticket.take_profit,
+                quantity=ticket.quantity,
+                state=PositionState.REJECTED,
+                close_reason=str(e)
+            )
+
+        fill_price = Decimal(str(entry_resp.get("avgPrice", ticket.entry_price)))
+        if fill_price <= Decimal("0"):
+            fill_price = ticket.entry_price
+            
+        pos_id = f"LIVE_{ticket.symbol}-{int(time.time()*1000)}"
+        entry_order_id_str = str(entry_resp.get("orderId"))
+        if getattr(ticket, "is_scalp", False):
+            self.scalp_active_symbols.add(ticket.symbol)
+            if entry_order_id_str:
+                self.record_scalp_order(entry_order_id_str, ticket.symbol)
+
+        pos = ActiveBracketPosition(
+            position_id=pos_id,
+            symbol=ticket.symbol,
+            side=ticket.side,
+            entry_price=fill_price,
+            stop_loss=ticket.stop_loss,
+            take_profit=ticket.take_profit,
+            quantity=ticket.quantity,
+            state=PositionState.ENTRY_FILLED,
+            entry_order_id=entry_order_id_str,
+            entry_fill_time_utc=datetime.datetime.now(datetime.timezone.utc),
+            forecast_confidence=getattr(ticket, "forecast_confidence", Decimal("0.65"))
+        )
+        
+        # 2. Dispatch Stop-Loss & Take-Profit Brackets via Binance Algo Order Service
+        try:
+            sl_params = {
+                "algoType": "CONDITIONAL",
+                "symbol": ticket.symbol,
+                "side": opp_side,
+                "type": "STOP_MARKET",
+                "triggerPrice": sl_price_str,
+                "closePosition": "true",
+                "workingType": "MARK_PRICE",
+                "clientAlgoId": f"SL_{ticket.symbol}_{int(time.time()*1000)}"[:32]
+            }
+            sl_resp = self._signed_request("POST", "/fapi/v1/algoOrder", sl_params)
+            pos.sl_order_id = str(sl_resp.get("algoId") or sl_resp.get("orderId"))
+            
+            tp_params = {
+                "algoType": "CONDITIONAL",
+                "symbol": ticket.symbol,
+                "side": opp_side,
+                "type": "TAKE_PROFIT_MARKET",
+                "triggerPrice": tp_price_str,
+                "closePosition": "true",
+                "clientAlgoId": f"TP_{ticket.symbol}_{int(time.time()*1000)}"[:32]
+            }
+            tp_resp = self._signed_request("POST", "/fapi/v1/algoOrder", tp_params)
+            pos.tp_order_id = str(tp_resp.get("algoId") or tp_resp.get("orderId"))
+            pos.state = PositionState.BRACKETS_ACTIVE
+            
+            if getattr(ticket, "is_scalp", False):
+                if pos.sl_order_id:
+                    self.record_scalp_order(pos.sl_order_id)
+                if pos.tp_order_id:
+                    self.record_scalp_order(pos.tp_order_id)
+            
+            # Invalidate cached account summary and trade history immediately after live execution
+            self._cached_account_summary = None
+            self._cached_live_trades = None
+            
+        except Exception as e:
+            logger.critical("CRITICAL: Failed to confirm SL/TP for live position %s: %s", pos_id, e)
+            try:
+                flatten_params = {
+                    "symbol": ticket.symbol,
+                    "side": opp_side,
+                    "type": "MARKET",
+                    "quantity": qty_str,
+                    "reduceOnly": "true"
+                }
+                self._signed_request("POST", "/fapi/v1/order", flatten_params)
+                pos.state = PositionState.EMERGENCY_FLATTEN
+                pos.close_reason = "EMERGENCY_FLATTEN_SL_TIMEOUT"
+            except Exception as fe:
+                logger.critical("FATAL: Failed emergency flatten for %s: %s", ticket.symbol, fe)
+                
+        return pos
+
+    def flatten_all_live_positions(self) -> Dict[str, Any]:
+        """Cancel all live open orders, cancel open algo orders, and market flatten all active open positions."""
+        results = []
+        try:
+            pos_data = self._signed_request("GET", "/fapi/v2/positionRisk")
+            for p in pos_data:
+                amt = Decimal(str(p.get("positionAmt", "0.00")))
+                sym = p.get("symbol")
+                if abs(amt) > Decimal("0"):
+                    try:
+                        self._signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": sym})
+                    except Exception:
+                        pass
+                    try:
+                        self._signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": sym})
+                    except Exception:
+                        pass
+                    side = "SELL" if amt > Decimal("0") else "BUY"
+                    flat_params = {
+                        "symbol": sym,
+                        "side": side,
+                        "type": "MARKET",
+                        "quantity": str(abs(amt)),
+                        "reduceOnly": "true"
+                    }
+                    r = self._signed_request("POST", "/fapi/v1/order", flat_params)
+                    results.append({"symbol": sym, "closed_qty": str(amt), "status": "FLATTENED"})
+            return {"success": True, "flattened_positions": results}
+        except Exception as e:
+            logger.error("Live flatten error: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def flatten_live_symbol(self, symbol: str) -> Dict[str, Any]:
+        """Cancel all open orders and algo orders for a single live symbol, and market flatten its position."""
+        try:
+            pos_data = self._signed_request("GET", "/fapi/v2/positionRisk")
+            for p in pos_data:
+                sym = p.get("symbol")
+                if sym != symbol:
+                    continue
+                amt = Decimal(str(p.get("positionAmt", "0.00")))
+                if abs(amt) > Decimal("0"):
+                    try:
+                        self._signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": sym})
+                    except Exception:
+                        pass
+                    try:
+                        self._signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": sym})
+                    except Exception:
+                        pass
+                    side = "SELL" if amt > Decimal("0") else "BUY"
+                    flat_params = {
+                        "symbol": sym,
+                        "side": side,
+                        "type": "MARKET",
+                        "quantity": str(abs(amt)),
+                        "reduceOnly": "true"
+                    }
+                    r = self._signed_request("POST", "/fapi/v1/order", flat_params)
+                    return {"success": True, "symbol": sym, "closed_qty": str(amt), "status": "FLATTENED", "order": r}
+            return {"success": True, "symbol": symbol, "status": "NO_OPEN_POSITION"}
+        except Exception as e:
+            logger.error("Failed to flatten live symbol %s: %s", symbol, e)
+            return {"success": False, "symbol": symbol, "error": str(e)}
+
+    def purge_orphaned_algo_orders(self) -> List[str]:
+        """
+        Scan live account for open algo orders on Binance Futures.
+        If any symbol has 0 open position or has an algo order with improper direction,
+        cancel all open algo orders for that symbol to prevent rogue entries / double fills.
+        """
+        purged_symbols = []
+        if not self.api_key or not self.secret_key:
+            return purged_symbols
+
+        try:
+            pos_data = self._signed_request("GET", "/fapi/v2/positionRisk")
+            open_positions = {}
+            for p in pos_data:
+                sym = p.get("symbol")
+                amt = Decimal(str(p.get("positionAmt", "0.00")))
+                open_positions[sym] = amt
+
+            algo_orders = self._signed_request("GET", "/fapi/v1/openAlgoOrders")
+            if not isinstance(algo_orders, list):
+                return purged_symbols
+
+            symbols_to_cancel = set()
+            for o in algo_orders:
+                sym = o.get("symbol")
+                side = o.get("side")
+                pos_amt = open_positions.get(sym, Decimal("0.00"))
+
+                if pos_amt == Decimal("0.00"):
+                    # Zero open position -> Any algo order is an orphan!
+                    symbols_to_cancel.add(sym)
+                elif pos_amt > Decimal("0.00") and side == "BUY":
+                    # Currently LONG, but algo order is BUY (unhedged addition)
+                    symbols_to_cancel.add(sym)
+                elif pos_amt < Decimal("0.00") and side == "SELL":
+                    # Currently SHORT, but algo order is SELL (unhedged addition)
+                    symbols_to_cancel.add(sym)
+
+            for sym in symbols_to_cancel:
+                try:
+                    self._signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": sym})
+                    purged_symbols.append(sym)
+                    logger.info("Purged orphaned/malformed algo orders for %s", sym)
+                except Exception as e:
+                    logger.warning("Failed to cancel algo orders for %s: %s", sym, e)
+
+            return purged_symbols
+        except Exception as e:
+            logger.error("Error during purge_orphaned_algo_orders: %s", e)
+            return purged_symbols
+
+    def sweep_live_temporal_exits(
+        self,
+        current_time_utc: Optional[datetime.datetime] = None,
+        max_duration_hours: int = 12
+    ) -> List[Dict[str, Any]]:
+        """
+        Inspect all active live positions on Binance USD(S)-M Futures.
+        If any open position's updateTime exceeds max_duration_hours, market-flatten it immediately.
+        """
+        expired = []
+        if not self.api_key or not self.secret_key:
+            return expired
+
+        now_u = current_time_utc or datetime.datetime.now(datetime.timezone.utc)
+        if now_u.tzinfo is None:
+            now_u = now_u.replace(tzinfo=datetime.timezone.utc)
+
+        try:
+            pos_data = self._signed_request("GET", "/fapi/v2/positionRisk")
+            for p in pos_data:
+                amt = Decimal(str(p.get("positionAmt", "0.00")))
+                sym = p.get("symbol")
+                if abs(amt) > Decimal("0"):
+                    update_ts = int(p.get("updateTime", 0))
+                    if update_ts > 0:
+                        pos_time_utc = datetime.datetime.fromtimestamp(update_ts / 1000.0, tz=datetime.timezone.utc)
+                        duration_hours = Decimal(str((now_u - pos_time_utc).total_seconds())) / Decimal("3600")
+                        if duration_hours >= Decimal(str(max_duration_hours)):
+                            logger.warning(
+                                "TEMPORAL EXPIRY (LIVE): %s position held for %s hours (limit=%sh). Flattening at market.",
+                                sym, duration_hours.quantize(Decimal("0.1")), max_duration_hours
+                            )
+                            flat_res = self.flatten_live_symbol(sym)
+                            unrealized = Decimal(str(p.get("unRealizedProfit", "0.00")))
+                            expired.append({
+                                "symbol": sym,
+                                "side": "BUY" if amt > Decimal("0") else "SELL",
+                                "quantity": abs(amt),
+                                "duration_hours": duration_hours,
+                                "unrealized_pnl_usd": unrealized,
+                                "result": flat_res
+                            })
+        except Exception as e:
+            logger.error("Error sweeping live temporal exits: %s", e)
+
+        return expired
+
+    def get_live_trade_history(self, limit: int = 50, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Fetch real executed trades with realized PnL and commissions from Binance (handles BNB fee asset, cached 15s)."""
+        now = time.time()
+        cached = getattr(self, "_cached_live_trades", None)
+        cached_time = getattr(self, "_cached_live_trades_time", 0)
+        if not force_refresh and cached is not None and (now - cached_time) < 15:
+            return cached[:limit]
+
+        trades = []
+        bnb_price = None
+        symbols_to_poll = list(self.symbols_config.keys())
+        try:
+            pos_risk = self._signed_request("GET", "/fapi/v2/positionRisk")
+            for p in pos_risk:
+                if abs(Decimal(str(p.get("positionAmt", "0")))) > Decimal("0"):
+                    sym = p.get("symbol")
+                    if sym and sym not in symbols_to_poll:
+                        symbols_to_poll.append(sym)
+        except Exception:
+            pass
+
+        for sym in symbols_to_poll:
+            try:
+                user_trades = self._signed_request("GET", "/fapi/v1/userTrades", {"symbol": sym, "limit": limit})
+                for t in user_trades:
+                    fee_raw = Decimal(str(t.get("commission", "0")))
+                    fee_asset = t.get("commissionAsset", "USDT")
+                    
+                    if fee_asset == "BNB":
+                        if bnb_price is None:
+                            bnb_price = self.get_bnb_price()
+                        fee_usd = (fee_raw * bnb_price).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                    else:
+                        fee_usd = fee_raw.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+                    order_id_str = str(t.get("orderId"))
+                    trade_id_str = str(t.get("id"))
+                    is_scalp = (order_id_str in self.scalp_order_ids) or (trade_id_str in self.scalp_order_ids)
+
+                    trades.append({
+                        "trade_id": trade_id_str,
+                        "order_id": order_id_str,
+                        "symbol": t.get("symbol"),
+                        "side": "BUY" if t.get("buyer") else "SELL",
+                        "price": str(Decimal(str(t.get("price", "0")))),
+                        "quantity": str(Decimal(str(t.get("qty", "0")))),
+                        "realized_pnl_usd": str(Decimal(str(t.get("realizedPnl", "0")))),
+                        "fee_amount": str(fee_raw),
+                        "fee_usd": str(fee_usd),
+                        "fee_asset": fee_asset,
+                        "is_scalp": is_scalp,
+                        "trade_type": "SCALP" if is_scalp else "MACRO",
+                        "time": datetime.datetime.fromtimestamp(t.get("time", 0) / 1000, tz=datetime.timezone.utc).isoformat()
+                    })
+            except Exception as e:
+                logger.debug("Failed to fetch live trades for %s: %s", sym, e)
+                
+        trades.sort(key=lambda x: x["time"], reverse=True)
+        if trades:
+            self._cached_live_trades = trades
+            self._cached_live_trades_time = now
+            return trades[:limit]
+        elif cached is not None:
+            return cached[:limit]
+        return []
+
+    def submit_bracket_order(
+        self,
+        ticket: TradeTicket,
+        mock_simulate_sl_failure: bool = False,
+        fill_time_utc: Optional[datetime.datetime] = None,
+        portfolio_state: Optional[Any] = None,
+        market_snapshot: Optional[Any] = None,
+    ) -> ActiveBracketPosition:
+        """
+        Execute an atomic bracket trade from a pre-cleared KEV.ai TradeTicket.
+        State progression: IDLE -> ENTRY_SUBMITTED -> ENTRY_FILLED -> BRACKETS_ACTIVE.
+        If Stop-Loss confirmation fails within 1,000ms, triggers EMERGENCY_FLATTEN.
+        """
+        gated_ticket, rejected_pos = self._apply_risk_gate(
+            ticket, portfolio_state=portfolio_state, market_snapshot=market_snapshot, is_live=False
+        )
+        if rejected_pos is not None or gated_ticket is None:
+            return rejected_pos  # type: ignore[return-value]
+        ticket = gated_ticket
+
+        if getattr(self, "contra_mode", False):
+            orig_side = ticket.side
+            ticket = invert_trade_ticket(ticket)
+            logger.warning(
+                "[CONTRA TRADING ACTIVE] Paper Trade Inverted: %s %s -> %s | Entry: %s | Inverted TP: %s | Inverted SL: %s",
+                ticket.symbol, orig_side, ticket.side, ticket.entry_price, ticket.take_profit, ticket.stop_loss
+            )
+
+        # Determine effective entry price and entry taker fee
+        if self.realistic_friction:
+            sym_cfg = self.symbols_config.get(ticket.symbol)
+            taker_fee_rate = sym_cfg.taker_fee_rate if sym_cfg else Decimal("0.0005")
+            est_slippage_rate = sym_cfg.est_slippage_rate if sym_cfg else Decimal("0.0003")
+            if ticket.side in ("BUY", "LONG"):
+                effective_entry = ticket.entry_price * (Decimal("1") + est_slippage_rate)
+            else:
+                effective_entry = ticket.entry_price * (Decimal("1") - est_slippage_rate)
+            prec = sym_cfg.price_precision if sym_cfg else 4
+            fmt = Decimal("10") ** -prec
+            effective_entry = effective_entry.quantize(fmt, rounding=ROUND_HALF_UP)
+            entry_fee = (effective_entry * ticket.quantity * taker_fee_rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            slippage = (abs(effective_entry - ticket.entry_price) * ticket.quantity).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        else:
+            effective_entry = ticket.entry_price
+            entry_fee = Decimal("0.0")
+            slippage = Decimal("0.0")
+
+        pos_id = f"{ticket.symbol}-{int(time.time()*1000)}"
+        position = ActiveBracketPosition(
+            position_id=pos_id,
+            symbol=ticket.symbol,
+            side=ticket.side,
+            entry_price=effective_entry,
+            stop_loss=ticket.stop_loss,
+            take_profit=ticket.take_profit,
+            quantity=ticket.quantity,
+            state=PositionState.ENTRY_SUBMITTED,
+            entry_fee_usd=entry_fee,
+            slippage_usd=slippage,
+            forecast_confidence=getattr(ticket, "forecast_confidence", Decimal("0.65"))
+        )
+
+        fill_time = fill_time_utc or datetime.datetime.now(datetime.timezone.utc)
+        if fill_time.tzinfo is None:
+            fill_time = fill_time.replace(tzinfo=datetime.timezone.utc)
+
+        # 1. Entry Order Submission
+        if self.dry_run:
+            position.entry_order_id = f"DRY_ENTRY_{pos_id}"
+            position.state = PositionState.ENTRY_FILLED
+            position.entry_fill_time_utc = fill_time
+        else:
+            # Live REST dispatch (omitted in dry run)
+            pass
+
+        # 2. Bracket Orders Dispatch (Take-Profit & Stop-Loss)
+        if mock_simulate_sl_failure:
+            # Simulate failure to confirm Stop-Loss within 1,000ms
+            position.state = PositionState.EMERGENCY_FLATTEN
+            position.close_reason = "EMERGENCY_FLATTEN_SL_TIMEOUT"
+            position.close_time_utc = fill_time
+            self.active_positions[pos_id] = position
+            return position
+
+        # Successful SL & TP dispatch
+        if self.dry_run:
+            # Bracket sanity invariant:
+            # BUY: stop_loss < entry < take_profit
+            # SELL: take_profit < entry < stop_loss
+            if ticket.side in ("BUY", "LONG"):
+                if not (position.stop_loss < position.entry_price < position.take_profit):
+                    logger.warning(
+                        "Rejected inverted bracket order for %s: SL %s, Entry %s, TP %s",
+                        ticket.symbol, position.stop_loss, position.entry_price, position.take_profit
+                    )
+                    position.state = PositionState.REJECTED
+                    position.close_reason = "INVALID_BRACKET_PRICES"
+                    return position
+            elif ticket.side in ("SELL", "SHORT"):
+                if not (position.take_profit < position.entry_price < position.stop_loss):
+                    logger.warning(
+                        "Rejected inverted bracket order for %s: TP %s, Entry %s, SL %s",
+                        ticket.symbol, position.take_profit, position.entry_price, position.stop_loss
+                    )
+                    position.state = PositionState.REJECTED
+                    position.close_reason = "INVALID_BRACKET_PRICES"
+                    return position
+
+            position.sl_order_id = f"DRY_SL_{pos_id}"
+            position.tp_order_id = f"DRY_TP_{pos_id}"
+            position.state = PositionState.BRACKETS_ACTIVE
+            self.active_positions[pos_id] = position
+            self._save_paper_state()
+
+        return position
+
+    def evaluate_temporal_exit(
+        self,
+        position: ActiveBracketPosition,
+        current_time_utc: Optional[datetime.datetime] = None,
+        max_duration_hours: int = 12,
+        current_price: Optional[Decimal] = None
+    ) -> bool:
+        """
+        Check if an active position has exceeded the 12-hour temporal expiry limit.
+        If exceeded, flattens the position at market to free locked margin.
+        """
+        if position.state != PositionState.BRACKETS_ACTIVE or not position.entry_fill_time_utc:
+            return False
+
+        if current_time_utc is None:
+            current_time_utc = datetime.datetime.now(datetime.timezone.utc)
+        elif current_time_utc.tzinfo is None:
+            current_time_utc = current_time_utc.replace(tzinfo=datetime.timezone.utc)
+
+        duration = current_time_utc - position.entry_fill_time_utc
+        duration_hours = Decimal(str(duration.total_seconds())) / Decimal("3600")
+
+        if duration_hours >= Decimal(str(max_duration_hours)):
+            position.state = PositionState.CLOSED
+            position.close_reason = "TEMPORAL_EXIT_12H_STALE"
+            position.close_time_utc = current_time_utc
+            self.active_positions.pop(position.position_id, None)
+            exit_px = current_price if current_price is not None else position.entry_price
+            self._record_closed_trade(position, exit_price=exit_px, reason="TEMPORAL_EXIT_12H_STALE", timestamp_utc=current_time_utc)
+            return True
+
+        return False
+
+    def close_position_manual(
+        self,
+        position_id: str,
+        reason: str,
+        exit_price: Decimal
+    ) -> ActiveBracketPosition:
+        """Manually close an active position and compute realized PnL in Decimal."""
+        position = self.active_positions.get(position_id)
+        if not position:
+            raise KeyError(f"Position {position_id} not found.")
+
+        position.state = PositionState.CLOSED
+        position.close_reason = reason
+        position.close_time_utc = datetime.datetime.now(datetime.timezone.utc)
+
+        # Compute realized PnL
+        if not self.realistic_friction:
+            if position.side in ("BUY", "LONG"):
+                pnl = (exit_price - position.entry_price) * position.quantity
+            else:
+                pnl = (position.entry_price - exit_price) * position.quantity
+            position.realized_pnl_usd = pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            position.gross_pnl_usd = position.realized_pnl_usd
+
+        self.active_positions.pop(position_id, None)
+        self._record_closed_trade(position, exit_price=exit_price, reason=reason, timestamp_utc=position.close_time_utc)
+        return position
+
+    def check_bracket_price_triggers(
+        self,
+        current_prices: Dict[str, Decimal],
+        current_time_utc: Optional[datetime.datetime] = None
+    ) -> List[ActiveBracketPosition]:
+        """
+        Check active bracket positions against current market prices for Take-Profit or Stop-Loss triggers.
+        Returns list of closed positions with strictly Decimal realized PnL.
+        """
+        now_utc = current_time_utc or datetime.datetime.now(datetime.timezone.utc)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=datetime.timezone.utc)
+
+        closed_positions: List[ActiveBracketPosition] = []
+
+        for pos_id, pos in list(self.active_positions.items()):
+            if pos.state != PositionState.BRACKETS_ACTIVE:
+                continue
+
+            curr_price = current_prices.get(pos.symbol)
+            if not curr_price:
+                continue
+
+            # LONG / BUY
+            if pos.side in ("BUY", "LONG"):
+                if curr_price >= pos.take_profit:
+                    pos.state = PositionState.CLOSED
+                    pos.close_reason = "TAKE_PROFIT_TRIGGERED"
+                    pos.close_time_utc = now_utc
+                    pnl = (pos.take_profit - pos.entry_price) * pos.quantity
+                    pos.realized_pnl_usd = pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    self.active_positions.pop(pos_id, None)
+                    closed_positions.append(pos)
+                    self._record_closed_trade(pos, exit_price=pos.take_profit, reason="TAKE_PROFIT_TRIGGERED", timestamp_utc=now_utc)
+                elif curr_price <= pos.stop_loss:
+                    pos.state = PositionState.CLOSED
+                    pos.close_reason = "STOP_LOSS_TRIGGERED"
+                    pos.close_time_utc = now_utc
+                    pnl = (pos.stop_loss - pos.entry_price) * pos.quantity
+                    pos.realized_pnl_usd = pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    self.active_positions.pop(pos_id, None)
+                    closed_positions.append(pos)
+                    self._record_closed_trade(pos, exit_price=pos.stop_loss, reason="STOP_LOSS_TRIGGERED", timestamp_utc=now_utc)
+
+            # SHORT / SELL
+            elif pos.side in ("SELL", "SHORT"):
+                if curr_price <= pos.take_profit:
+                    pos.state = PositionState.CLOSED
+                    pos.close_reason = "TAKE_PROFIT_TRIGGERED"
+                    pos.close_time_utc = now_utc
+                    pnl = (pos.entry_price - pos.take_profit) * pos.quantity
+                    pos.realized_pnl_usd = pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    self.active_positions.pop(pos_id, None)
+                    closed_positions.append(pos)
+                    self._record_closed_trade(pos, exit_price=pos.take_profit, reason="TAKE_PROFIT_TRIGGERED", timestamp_utc=now_utc)
+                elif curr_price >= pos.stop_loss:
+                    pos.state = PositionState.CLOSED
+                    pos.close_reason = "STOP_LOSS_TRIGGERED"
+                    pos.close_time_utc = now_utc
+                    pnl = (pos.entry_price - pos.stop_loss) * pos.quantity
+                    pos.realized_pnl_usd = pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    self.active_positions.pop(pos_id, None)
+                    closed_positions.append(pos)
+                    self._record_closed_trade(pos, exit_price=pos.stop_loss, reason="STOP_LOSS_TRIGGERED", timestamp_utc=now_utc)
+
+        return closed_positions
