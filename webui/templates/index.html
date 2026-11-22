@@ -2754,6 +2754,139 @@
             </div>
         </div>
 
+        <!-- NEON v2.0 Dynamic Adaptive Quant Engine & AI-Assisted Bleed Auditor -->
+        <div class="panel" id="neon-dynamic-ai-panel" data-drag-item="neon-dynamic-ai" data-collapsible="true">
+            <div class="panel-header neon-eq-header">
+                <div class="panel-header-left">
+                    <div class="panel-title-group">
+                        <span class="panel-title">NEON v2.0 Dynamic Adaptive Engine &amp; AI Bleed Auditor</span>
+                        <span class="panel-subtitle" id="neon-dyn-subtitle">Real-time volatility &amp; Kelly scaling · Drawdown bleed circuit · AI root-cause diagnosis &amp; 1-click surgical patching</span>
+                    </div>
+                </div>
+                <div class="panel-header-actions neon-eq-controls">
+                    <div class="neon-seg-group" role="group" aria-label="Dynamic telemetry mode">
+                        <button type="button" id="neon-bleed-mode-live" class="neon-seg-btn active" onclick="setNeonBleedDrillMode(false)">Live Telemetry</button>
+                        <button type="button" id="neon-bleed-mode-drill" class="neon-seg-btn" onclick="setNeonBleedDrillMode(true)">Bleed Stress Drill</button>
+                    </div>
+                    <button type="button" id="neon-dyn-adapt-btn" class="btn-secondary btn-sm" onclick="toggleNeonDynamicFlag('dynamic_adaptation_enabled')">Auto-Adapt: ON</button>
+                    <button type="button" id="neon-dyn-guard-btn" class="btn-secondary btn-sm" onclick="toggleNeonDynamicFlag('auto_bleed_guard_enabled')">Bleed Guard: ON</button>
+                    <button type="button" class="btn-secondary btn-sm" onclick="loadNeonDynamicState()">Refresh</button>
+                </div>
+            </div>
+
+            <div class="panel-body-collapsible">
+                <!-- Band 1: Hairline Dynamic Microstructure & Bleed Health Strip -->
+                <div class="neon-dyn-health-strip">
+                    <div class="neon-eq-stat">
+                        <span class="neon-eq-stat-lbl">Microstructure Regime</span>
+                        <span class="neon-eq-stat-val text-cyan" id="neon-dyn-regime">--</span>
+                    </div>
+                    <div class="neon-eq-stat">
+                        <span class="neon-eq-stat-lbl">Bleed Circuit Tier</span>
+                        <span class="neon-eq-stat-val text-pos" id="neon-dyn-tier">NOMINAL · 0/100</span>
+                    </div>
+                    <div class="neon-eq-stat">
+                        <span class="neon-eq-stat-lbl">Rolling 10T Expectancy</span>
+                        <span class="neon-eq-stat-val" id="neon-dyn-exp">--</span>
+                    </div>
+                    <div class="neon-eq-stat">
+                        <span class="neon-eq-stat-lbl">Drawdown / Loss Streak</span>
+                        <span class="neon-eq-stat-val" id="neon-dyn-dd-streak">--</span>
+                    </div>
+                    <div class="neon-eq-stat">
+                        <span class="neon-eq-stat-lbl">Adaptive Risk (Kelly)</span>
+                        <span class="neon-eq-stat-val text-cyan" id="neon-dyn-risk-mult">--</span>
+                    </div>
+                </div>
+
+                <!-- Band 2: Two-Column Dynamic Quant Telemetry vs AI Bleed Assessment -->
+                <div class="neon-dyn-split">
+                    <!-- Left: Real-Time Adaptive Overrides & Per-Symbol Bleed Health -->
+                    <div class="neon-dyn-col">
+                        <div class="neon-dyn-col-head">
+                            <span class="neon-dyn-col-title">Live Adaptive Parameter Matrix</span>
+                            <span class="neon-dyn-col-meta" id="neon-dyn-vol-meta">ATR Vol Ratio: --x · Avg ADX: --</span>
+                        </div>
+
+                        <div class="neon-dyn-param-grid" id="neon-dyn-param-grid">
+                            <div class="neon-dyn-param-item">
+                                <span class="neon-dyn-param-lbl">Risk / Trade</span>
+                                <span class="neon-dyn-param-val" id="ndp-risk">--</span>
+                            </div>
+                            <div class="neon-dyn-param-item">
+                                <span class="neon-dyn-param-lbl">Min ADX(14)</span>
+                                <span class="neon-dyn-param-val" id="ndp-adx">--</span>
+                            </div>
+                            <div class="neon-dyn-param-item">
+                                <span class="neon-dyn-param-lbl">Stop Buffer</span>
+                                <span class="neon-dyn-param-val" id="ndp-sl">--</span>
+                            </div>
+                            <div class="neon-dyn-param-item">
+                                <span class="neon-dyn-param-lbl">TP Target</span>
+                                <span class="neon-dyn-param-val" id="ndp-tp">--</span>
+                            </div>
+                            <div class="neon-dyn-param-item">
+                                <span class="neon-dyn-param-lbl">Max Slots</span>
+                                <span class="neon-dyn-param-val" id="ndp-slots">--</span>
+                            </div>
+                            <div class="neon-dyn-param-item">
+                                <span class="neon-dyn-param-lbl">SL Cooldown</span>
+                                <span class="neon-dyn-param-val" id="ndp-cd">--</span>
+                            </div>
+                        </div>
+
+                        <div class="neon-dyn-triggers" id="neon-dyn-triggers">
+                            <div class="neon-dyn-trigger-line">Evaluating live bleed sensors...</div>
+                        </div>
+
+                        <div class="neon-dyn-col-head" style="margin-top: 12px;">
+                            <span class="neon-dyn-col-title">Per-Symbol Bleed Health (Tier-1 Core)</span>
+                            <span class="neon-dyn-col-meta" id="neon-dyn-feedrag">Fee Drag: --%</span>
+                        </div>
+                        <div class="neon-dyn-symbols-list" id="neon-dyn-symbols-list"></div>
+                    </div>
+
+                    <!-- Right: Server-Side Gemini AI Bleed Assessment & Surgical Patch -->
+                    <div class="neon-dyn-col neon-dyn-ai-col">
+                        <div class="neon-dyn-col-head">
+                            <span class="neon-dyn-col-title">AI-Assisted Bleed Assessment</span>
+                            <span class="neon-dyn-col-meta" id="neon-ai-audit-meta">Ready for on-demand quant audit</span>
+                        </div>
+
+                        <div class="neon-ai-prompt-row">
+                            <input type="text" id="neon-ai-focus-input" class="field-input neon-ai-focus-input" placeholder="Optional quant focus (e.g., Audit SOL stop-outs or fee drag during NY open)..." maxlength="260">
+                            <button type="button" id="neon-ai-run-btn" class="btn-primary btn-sm" onclick="runNeonAiBleedAudit()">Run AI Bleed Audit</button>
+                        </div>
+
+                        <div id="neon-ai-error-box" class="neon-ai-error-box" style="display: none;"></div>
+
+                        <div id="neon-ai-empty-state" class="neon-ai-empty-state">
+                            Run an AI Bleed Assessment to inspect active drawdown vectors, losing streaks, fee drag, and regime mismatches — and generate a bounded 1-click parameter remediation patch.
+                        </div>
+
+                        <div id="neon-ai-result-wrap" class="neon-ai-result-wrap" style="display: none;">
+                            <div class="neon-ai-verdict-head">
+                                <div class="neon-ai-headline" id="neon-ai-headline">--</div>
+                                <div class="neon-ai-verdict-meta" id="neon-ai-verdict-meta">--</div>
+                            </div>
+                            <p class="neon-ai-summary" id="neon-ai-summary"></p>
+
+                            <div class="neon-ai-subhead">Root-Cause Bleed Vectors</div>
+                            <div class="neon-ai-causes" id="neon-ai-causes"></div>
+
+                            <div class="neon-ai-subhead">Surgical Remediation Plan</div>
+                            <ul class="neon-ai-plan-list" id="neon-ai-plan-list"></ul>
+
+                            <div class="neon-ai-patch-bar">
+                                <div class="neon-ai-patch-preview" id="neon-ai-patch-preview"></div>
+                                <button type="button" id="neon-ai-apply-btn" class="btn-primary btn-sm" onclick="applyNeonAiPatch()">Apply AI Patch</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- D3.js Equity Curve: NEON Strategy vs. Buy-and-Hold -->
         <div class="panel" id="neon-equity-curve-panel" data-drag-item="neon-equity-curve" data-collapsible="true">
             <div class="panel-header neon-eq-header">

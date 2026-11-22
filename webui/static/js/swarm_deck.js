@@ -907,16 +907,18 @@
     if (typeof window.axios === 'undefined') return;
 
     try {
-      const [ovRes, eqRes] = await Promise.all([
+      const [ovRes, eqRes, dynRes] = await Promise.all([
         window.axios.get('/api/neon/overview', { timeout: 9000 }),
         window.axios.get('/api/neon/equity-curve', {
           params: { scope: 'CORE_BASKET', mirror_bull: 'false', initial_equity: 200 },
           timeout: 9000
-        })
+        }),
+        window.axios.get('/api/neon/dynamic-state', { timeout: 9000 }).catch(() => null)
       ]);
 
       const overview = ovRes && ovRes.data && ovRes.data.success ? ovRes.data : null;
       const equityPayload = eqRes && eqRes.data && eqRes.data.success ? eqRes.data.equity_curve : null;
+      const dynState = dynRes && dynRes.data && dynRes.data.success ? dynRes.data.dynamic_state : null;
 
       if (!overview && !equityPayload) {
         throw new Error('Empty NEON telemetry payload');
@@ -925,6 +927,27 @@
       cachedNeonOverview = overview;
       cachedNeonEquity = equityPayload;
       applyNeonTelemetryToBots(overview, equityPayload);
+
+      if (dynState) {
+        const tier = dynState.bleed_telemetry ? dynState.bleed_telemetry.circuit_tier : 'NOMINAL';
+        const score = dynState.bleed_telemetry ? dynState.bleed_telemetry.bleed_score : 0;
+        const regime = dynState.microstructure ? String(dynState.microstructure.regime || '').replace(/_/g, ' ') : '';
+        const effRisk = dynState.adaptive_params ? dynState.adaptive_params.effective_risk_pct : null;
+        const b5 = bots.find((x) => x.id === 'BOT-05');
+        const b6 = bots.find((x) => x.id === 'BOT-06');
+        if (b5 && regime) b5.role = `Trend Hunter · ${regime}`;
+        if (b6) b6.role = `Maker Arbiter · ${tier} (${effRisk ? `${effRisk}%` : '2bps'})`;
+        renderFleetRoster();
+        renderInspector();
+
+        if (labelEl) {
+          labelEl.classList.remove('standby');
+          labelEl.textContent = `NEON v2 · ${tier} (${score}/100) · ${fmtUtcClock()}`;
+        }
+      } else if (labelEl) {
+        labelEl.classList.remove('standby');
+        labelEl.textContent = `NEON Live · ${fmtUtcClock()}`;
+      }
 
       // Subtle worker pulse on NEON bots when live sync succeeds
       ['BOT-05', 'BOT-06'].forEach((id) => {
@@ -937,11 +960,6 @@
           });
         }
       });
-
-      if (labelEl) {
-        labelEl.classList.remove('standby');
-        labelEl.textContent = `NEON Live · ${fmtUtcClock()}`;
-      }
     } catch (err) {
       if (labelEl) {
         labelEl.classList.add('standby');

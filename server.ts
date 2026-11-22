@@ -37,6 +37,10 @@ import {
   NEON_CORE_UNIVERSE,
   NEON_QUARANTINED_SYMBOLS,
 } from './src/server/neonStrategy.js';
+import {
+  computeNeonDynamicState,
+  runNeonAiBleedAssessment,
+} from './src/server/neonDynamicAi.js';
 
 const PORT = parseInt(process.env.PORT || process.env.KRONOS_PORT || '3000', 10);
 const HOST = process.env.KRONOS_HOST || '0.0.0.0';
@@ -1745,6 +1749,123 @@ app.post('/api/neon/execute', async (req: Request, res: Response) => {
   }
 });
 
+// NEON v2.0 Dynamic Adaptive Quant State & AI-Assisted Bleed Auditor Routes
+app.get('/api/neon/dynamic-state', async (req: Request, res: Response) => {
+  try {
+    const simulateBleed = String(req.query.simulate_bleed || 'false').toLowerCase() === 'true';
+    const config = loadNeonConfig();
+    const tickers = await fetchBinanceTickers();
+    const dynamicState = await computeNeonDynamicState({
+      tickers,
+      equityUsd: paperCurrentEquity,
+      openPositionCount: paperOpenPositions.length,
+      config,
+      simulateBleed,
+    });
+    res.json({ success: true, dynamic_state: dynamicState });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+app.post('/api/neon/dynamic-mode', async (req: Request, res: Response) => {
+  try {
+    const patch: Record<string, boolean> = {};
+    if (typeof req.body?.dynamic_adaptation_enabled === 'boolean') {
+      patch.dynamic_adaptation_enabled = req.body.dynamic_adaptation_enabled;
+    }
+    if (typeof req.body?.auto_bleed_guard_enabled === 'boolean') {
+      patch.auto_bleed_guard_enabled = req.body.auto_bleed_guard_enabled;
+    }
+    const updated = saveNeonConfig(patch);
+    const tickers = await fetchBinanceTickers();
+    const dynamicState = await computeNeonDynamicState({
+      tickers,
+      equityUsd: paperCurrentEquity,
+      openPositionCount: paperOpenPositions.length,
+      config: updated,
+      simulateBleed: Boolean(req.body?.simulate_bleed),
+    });
+    res.json({
+      success: true,
+      config: updated,
+      dynamic_state: dynamicState,
+      message: `NEON Dynamic Controls updated (Auto-Adapt: ${updated.dynamic_adaptation_enabled ? 'ON' : 'OFF'} · Bleed Guard: ${updated.auto_bleed_guard_enabled ? 'ON' : 'OFF'}).`,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+app.post('/api/neon/ai-bleed-audit', async (req: Request, res: Response) => {
+  try {
+    const simulateBleed = Boolean(req.body?.simulate_bleed ?? false);
+    const focusNote = typeof req.body?.focus_note === 'string' ? req.body.focus_note : undefined;
+    const config = loadNeonConfig();
+    const tickers = await fetchBinanceTickers();
+    const dynamicState = await computeNeonDynamicState({
+      tickers,
+      equityUsd: paperCurrentEquity,
+      openPositionCount: paperOpenPositions.length,
+      config,
+      simulateBleed,
+    });
+    const assessment = await runNeonAiBleedAssessment({
+      dynamicState,
+      config,
+      focusNote,
+    });
+    res.json({
+      success: true,
+      assessment,
+      dynamic_state: {
+        ...dynamicState,
+        latest_ai_assessment: assessment,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const status = message.includes('GEMINI_API_KEY') ? 503 : 500;
+    res.status(status).json({ success: false, error: message });
+  }
+});
+
+app.post('/api/neon/ai-apply-patch', async (req: Request, res: Response) => {
+  try {
+    const patch = req.body?.patch;
+    if (!patch || typeof patch !== 'object') {
+      res.status(400).json({ success: false, error: 'Missing AI remediation patch payload.' });
+      return;
+    }
+    const updated = saveNeonConfig({
+      risk_per_trade_pct: patch.risk_per_trade_pct,
+      min_adx_14: patch.min_adx_14,
+      tp_r_multiple: patch.tp_r_multiple,
+      sl_atr_multiplier: patch.sl_atr_multiplier,
+      sl_cooldown_minutes: patch.sl_cooldown_minutes,
+      max_concurrent_positions: patch.max_concurrent_positions,
+      session_gate_enabled: patch.session_gate_enabled,
+      enabled: patch.enabled,
+    });
+    const tickers = await fetchBinanceTickers();
+    const dynamicState = await computeNeonDynamicState({
+      tickers,
+      equityUsd: paperCurrentEquity,
+      openPositionCount: paperOpenPositions.length,
+      config: updated,
+      simulateBleed: Boolean(req.body?.simulate_bleed),
+    });
+    res.json({
+      success: true,
+      config: updated,
+      dynamic_state: dynamicState,
+      message: `Applied AI Remediation Patch: Risk ${updated.risk_per_trade_pct}% · ADX >= ${updated.min_adx_14} · SL ${updated.sl_atr_multiplier}x ATR · TP ${updated.tp_r_multiple}R · Cooldown ${updated.sl_cooldown_minutes}m.`,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
 // ============================================================================
 // HTTP Server + Multiplexed Swarm WebSocket Telemetry Hub (/swarm on port 3000)
 // ============================================================================
@@ -1768,8 +1889,8 @@ wsServer.on('connection', (socket: WebSocket) => {
     JSON.stringify({
       type: 'heartbeat',
       timestamp_utc: new Date().toISOString(),
-      bots: 4,
-      workers: 24,
+      bots: 6,
+      workers: 36,
       status: 'ONLINE',
     })
   );
