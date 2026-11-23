@@ -1237,6 +1237,27 @@ class BinanceAtomicExecutor:
             return rejected_pos  # type: ignore[return-value]
         ticket = gated_ticket
 
+        # Strict Execution Mutual Exclusion Invariant: Only AWS EC2 instance has authority to trade live real capital
+        instance_tag = os.getenv("KRONOS_INSTANCE_TAG", "PC").strip().upper()
+        if instance_tag != "AWS":
+            logger.error(
+                "[EXECUTION MUTUAL EXCLUSION] Live order execution REJECTED: Only AWS EC2 instance has authority to trade live real capital. "
+                "Current instance tag: '%s'. Local PC instance is strictly in view/paper mode only.",
+                instance_tag
+            )
+            pos_id = f"REJECTED_NON_AWS_{ticket.symbol}_{int(time.time()*1000)}"
+            return ActiveBracketPosition(
+                position_id=pos_id,
+                symbol=ticket.symbol,
+                side=ticket.side,
+                entry_price=ticket.entry_price,
+                stop_loss=ticket.stop_loss,
+                take_profit=ticket.take_profit,
+                quantity=ticket.quantity,
+                state=PositionState.REJECTED,
+                close_reason=f"NON_AWS_LIVE_EXECUTION_BLOCKED: Only AWS instance is authorized for real live trading (current instance: '{instance_tag}')"
+            )
+
         # Ensure isolated contract leverage is at least 3x (up to 5x) to prevent 100% margin lock on micro-notionals
         exchange_lev = max(3, min(5, ticket.effective_leverage))
         self.ensure_isolated_margin(ticket.symbol, leverage=exchange_lev)
@@ -1246,7 +1267,6 @@ class BinanceAtomicExecutor:
         tp_price_str = str(ticket.take_profit.quantize(fmt_price, rounding=ROUND_HALF_UP))
         
         # 1. Entry Market Order
-        instance_tag = os.getenv("KRONOS_INSTANCE_TAG", "PC").strip().upper()
         entry_params = {
             "symbol": ticket.symbol,
             "side": side,

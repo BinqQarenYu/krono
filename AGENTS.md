@@ -59,3 +59,10 @@ To prevent cognitive degradation, hallucination, and convoluted context windows:
 - **Proactive Early Warning:** When a conversation reaches ~50+ turns, when tool/skill exclusions occur due to context budget limits, or when tasks drift into multiple disparate domains, the agent MUST proactively alert the user.
 - **Actionable Remediation:** Advise the user to execute `/compact` to condense session history in place, or transition to a fresh conversation for focused execution.
 
+---
+
+## 8. AWS Exclusive Live Execution & Data Push Hierarchy
+Only AWS EC2 (`KRONOS_INSTANCE_TAG=AWS`) has the right to trade live real capital on Binance USD-M Futures.
+- **Fail-Closed Mutual Exclusion:** Local PC (`KRONOS_INSTANCE_TAG=PC`), local scripts, and testing environments are strictly forbidden from placing real live orders (`submit_live_bracket_order` hard fails closed if `instance_tag != 'AWS'`).
+- **Data Flow Standard:** All real live trading telemetry, account equity, positions, order state, and quotas originate on AWS and are pushed / synchronized to the local PC via the encrypted tunnel bridge (`aws_telemetry_bridge`) and push receiver (`/api/telemetry/push`). The PC operates strictly as a telemetry receiver and paper simulator.
+

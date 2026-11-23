@@ -1,13 +1,13 @@
 {
   "enabled": false,
   "interval_seconds": 60,
-  "live_trading_enabled": true,
+  "live_trading_enabled": false,
   "live_trading_interval": 300,
   "trade_cap": 8,
-  "session_trades": 4,
+  "session_trades": 8,
   "live_last_cycle_summary": {
     "success": false,
-    "timestamp": "2026-11-22T19:20:17.587481+00:00",
+    "timestamp": "2026-11-23T02:57:35.621396+00:00",
     "error": "Binance Futures API Error (401): Invalid API-key, IP, or permissions for action, request ip: 96.0.146.54",
     "live_account": {
       "connected": false,
@@ -1087,5 +1087,5 @@
   "gemini_auto_apply": true,
   "latest_gemini_assessment": null,
   "contra_mode": false,
-  "updated_at": "2026-11-22T19:20:17.588066+00:00"
+  "updated_at": "2026-11-23T03:01:11.507420+00:00"
 }

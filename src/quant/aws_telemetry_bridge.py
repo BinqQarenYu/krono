@@ -112,9 +112,10 @@ class AWSTelemetryBridge:
                         "-o", "ExitOnForwardFailure=yes",
                         "-N",
                         "-L", f"{self.local_port}:localhost:{self.remote_port}",
+                        "-R", "7073:127.0.0.1:7070",
                         f"{self.user}@{self.host}"
                     ]
-                    logger.info("Spawning SSH tunnel to %s...", self.host)
+                    logger.info("Spawning SSH tunnel to %s (L:%d->%d, R:7073->7070)...", self.host, self.local_port, self.remote_port)
                     self._ssh_proc = subprocess.Popen(
                         cmd,
                         stdout=subprocess.DEVNULL,
@@ -150,6 +151,34 @@ class AWSTelemetryBridge:
                 try:
                     # 1. Fetch live status (balance, positions, autopilot)
                     self._cached_live_status = self.fetch_remote_json("/api/live/status")
+                    if self._cached_live_status and self._cached_live_status.get("success"):
+                        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                        t_quota = self._cached_live_status.get("trade_quota")
+                        if t_quota:
+                            q_file = os.path.join(project_root, "data", "aws_trade_quota.json")
+                            try:
+                                with open(q_file, "w", encoding="utf-8") as f:
+                                    json.dump({
+                                        "live_trading_enabled": self._cached_live_status.get("mutual_exclusion", {}).get("live_trading_active", False),
+                                        "live_trade_cap": t_quota.get("trade_cap", 8),
+                                        "live_session_trades": t_quota.get("session_trades", 8),
+                                        "live_cap_reached_utc": t_quota.get("cap_reached_utc"),
+                                        "sole_live_engine": "NEON_V1",
+                                        "updated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                                    }, f, indent=2)
+                            except Exception:
+                                pass
+
+                        # Auto-sync bot_positions_registry.json
+                        la = self._cached_live_status.get("live_account") or {}
+                        pos_list = la.get("positions", [])
+                        pos_map = {p["symbol"]: "NEON" for p in pos_list if p.get("symbol")}
+                        reg_file = os.path.join(project_root, "data", "bot_positions_registry.json")
+                        try:
+                            with open(reg_file, "w", encoding="utf-8") as f:
+                                json.dump({"positions": pos_map, "orders": {}}, f, indent=2)
+                        except Exception:
+                            pass
 
                     # 2. Fetch tiger radar
                     radar_data = self.fetch_remote_json("/api/tiger/radar")
@@ -184,7 +213,7 @@ class AWSTelemetryBridge:
                     logger.debug("Sync poll error: %s", e)
             time.sleep(2.0)
 
-    def fetch_remote_json(self, endpoint: str, timeout: float = 2.5) -> dict:
+    def fetch_remote_json(self, endpoint: str, timeout: float = 6.0) -> dict:
         """Fetches a JSON endpoint from EC2 over the local tunnel."""
         if not endpoint.startswith("/"):
             endpoint = "/" + endpoint
@@ -198,7 +227,7 @@ class AWSTelemetryBridge:
             logger.debug("fetch_remote_json %s failed: %s", endpoint, e)
         return {}
 
-    def post_remote_json(self, endpoint: str, payload: dict = None, timeout: float = 4.0) -> dict:
+    def post_remote_json(self, endpoint: str, payload: dict = None, timeout: float = 8.0) -> dict:
         """Dispatches a POST command to EC2 over the local tunnel."""
         if not endpoint.startswith("/"):
             endpoint = "/" + endpoint
