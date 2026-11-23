@@ -12,11 +12,24 @@ import os
 import sys
 import time
 import json
+import datetime
 import logging
 import threading
 import subprocess
 import urllib.request
 import urllib.error
+
+def _atomic_json_dump(filepath: str, data: dict) -> bool:
+    """Atomically write JSON data to avoid 0-byte file truncation under concurrent reads."""
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        tmp = filepath + f".tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, filepath)
+        return True
+    except Exception:
+        return False
 
 logger = logging.getLogger("AWSTelemetryBridge")
 if not logger.handlers:
@@ -156,29 +169,21 @@ class AWSTelemetryBridge:
                         t_quota = self._cached_live_status.get("trade_quota")
                         if t_quota:
                             q_file = os.path.join(project_root, "data", "aws_trade_quota.json")
-                            try:
-                                with open(q_file, "w", encoding="utf-8") as f:
-                                    json.dump({
-                                        "live_trading_enabled": self._cached_live_status.get("mutual_exclusion", {}).get("live_trading_active", False),
-                                        "live_trade_cap": t_quota.get("trade_cap", 8),
-                                        "live_session_trades": t_quota.get("session_trades", 8),
-                                        "live_cap_reached_utc": t_quota.get("cap_reached_utc"),
-                                        "sole_live_engine": "NEON_V1",
-                                        "updated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()
-                                    }, f, indent=2)
-                            except Exception:
-                                pass
+                            _atomic_json_dump(q_file, {
+                                "live_trading_enabled": self._cached_live_status.get("mutual_exclusion", {}).get("live_trading_active", False),
+                                "live_trade_cap": t_quota.get("trade_cap", 8),
+                                "live_session_trades": t_quota.get("session_trades", 8),
+                                "live_cap_reached_utc": t_quota.get("cap_reached_utc"),
+                                "sole_live_engine": "NEON_V1",
+                                "updated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            })
 
                         # Auto-sync bot_positions_registry.json
                         la = self._cached_live_status.get("live_account") or {}
                         pos_list = la.get("positions", [])
                         pos_map = {p["symbol"]: "NEON" for p in pos_list if p.get("symbol")}
                         reg_file = os.path.join(project_root, "data", "bot_positions_registry.json")
-                        try:
-                            with open(reg_file, "w", encoding="utf-8") as f:
-                                json.dump({"positions": pos_map, "orders": {}}, f, indent=2)
-                        except Exception:
-                            pass
+                        _atomic_json_dump(reg_file, {"positions": pos_map, "orders": {}})
 
                     # 2. Fetch tiger radar
                     radar_data = self.fetch_remote_json("/api/tiger/radar")
@@ -187,11 +192,7 @@ class AWSTelemetryBridge:
                         # Also sync to local data/tiger_radar.json for offline resilience
                         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                         local_rf = os.path.join(project_root, "data", "tiger_radar.json")
-                        try:
-                            with open(local_rf, "w", encoding="utf-8") as f:
-                                json.dump(self._cached_tiger_radar, f, indent=2)
-                        except Exception:
-                            pass
+                        _atomic_json_dump(local_rf, self._cached_tiger_radar)
 
                     # 3. Fetch tiger state and sync to local data/tiger_state.json
                     state_data = self.fetch_remote_json("/api/tiger/state")
@@ -199,11 +200,7 @@ class AWSTelemetryBridge:
                         self._cached_tiger_state = state_data.get("state", {})
                         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                         local_sf = os.path.join(project_root, "data", "tiger_state.json")
-                        try:
-                            with open(local_sf, "w", encoding="utf-8") as f:
-                                json.dump(self._cached_tiger_state, f, indent=2)
-                        except Exception:
-                            pass
+                        _atomic_json_dump(local_sf, self._cached_tiger_state)
 
                     # 4. Fetch live trades for local cache
                     trades_data = self.fetch_remote_json("/api/live/trades?limit=50")
